@@ -1,0 +1,83 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+
+# Virtual environments and local Python installs
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.Python
+__pypackages__/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.ini
+*.local.ini
+
+# Logs and runtime data
+log/
+logs/
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# Build, distribution, and packaging outputs
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+sdist/
+parts/
+var/
+target/
+*.manifest
+dist.zip
+*.zip
+
+# PyInstaller generated files
+*.spec
+
+# Project-generated product output
+products/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+.spyderproject
+.spyproject
+.ropeproject
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Notebook and docs build output
+.ipynb_checkpoints/
+docs/_build/
+site/

@@ -1,0 +1,20 @@
+[
+  {
+    "site_id": "e278c04d-46d7-46e0-90bf-98f40589f7f8",
+    "enabled": true,
+    "name": "新站点",
+    "products_dir": "",
+    "wp_domain": "https://eveningbagmanufacturer.com",
+    "wp_username": "joyfeng@junhaohandbag.com",
+    "wp_password": "pBgH VRic N5qI DOyS 6Y9f XG3c",
+    "ai_api_key": "sk-2c6f84609c6c47c797478feecf17333d",
+    "ai_base_url": "https://api.deepseek.com/v1",
+    "default_model": "deepseek-chat",
+    "bak_ai_api_key": "sk-5f86d227168b4076a4f4311d8c53a426",
+    "bak_ai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "bak_default_model": "qwen3.5-flash-2026-02-23",
+    "seo_min_score": "65",
+    "seo_max_retries": "5",
+    "mode": "full"
+  }
+]
