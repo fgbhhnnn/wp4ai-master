@@ -53,18 +53,82 @@ def _response_brief(resp: requests.Response, limit: int = 220) -> str:
     return body
 
 
+def _normalize_wp_domain(domain: str) -> str:
+    return str(domain or "").strip().rstrip("/")
+
+
+def _response_history_brief(resp: requests.Response) -> str:
+    history = getattr(resp, "history", None) or []
+    if not history:
+        return "none"
+    return " -> ".join(
+        f"{getattr(item, 'status_code', '?')} {getattr(item, 'url', '')}"
+        for item in history
+    )
+
+
+def _response_diagnostic(resp: requests.Response, limit: int = 500) -> str:
+    content_type = resp.headers.get("Content-Type", "")
+    return (
+        f"HTTP {resp.status_code}, url={getattr(resp, 'url', '')}, "
+        f"Content-Type={content_type}, history={_response_history_brief(resp)}, "
+        f"Body={_response_brief(resp, limit)!r}"
+    )
+
+
+def _http_error_diagnostic(err: requests.exceptions.HTTPError) -> str:
+    resp = getattr(err, "response", None)
+    if resp is None:
+        return str(err)
+    return f"{err}; {_response_diagnostic(resp)}"
+
+
+def _term_exists_id_from_response(resp: requests.Response) -> int | None:
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("code") != "term_exists":
+        return None
+    data = payload.get("data") or {}
+    term_id = data.get("term_id") if isinstance(data, dict) else None
+    try:
+        return int(term_id) if term_id else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _term_exists_id_from_http_error(err: requests.exceptions.HTTPError) -> int | None:
+    resp = getattr(err, "response", None)
+    if resp is None:
+        return None
+    return _term_exists_id_from_response(resp)
+
+
+class UnexpectedWPResponseError(RuntimeError):
+    pass
+
+
 def _json_or_raise(resp: requests.Response, action: str):
     try:
         return resp.json()
     except Exception as exc:  # noqa: BLE001
-        content_type = resp.headers.get("Content-Type", "")
         hint = ""
         if _looks_like_sgcaptcha(resp.text):
             hint = "；检测到 SiteGround SGCaptcha/Anti-Bot 拦截，请在主机/WAF 放行 wp-json 与 rest_route API 请求"
         raise RuntimeError(
-            f"{action} 返回非 JSON 响应: HTTP {resp.status_code}, "
-            f"Content-Type={content_type}, Body={_response_brief(resp)!r}{hint}"
+            f"{action} 返回非 JSON 响应: {_response_diagnostic(resp, limit=220)}{hint}"
         ) from exc
+
+
+def _json_object_or_raise(resp: requests.Response, action: str) -> dict:
+    data = _json_or_raise(resp, action)
+    if not isinstance(data, dict):
+        raise UnexpectedWPResponseError(
+            f"{action} 返回 JSON 结构异常: expected=dict, "
+            f"actual={type(data).__name__}, {_response_diagnostic(resp)}"
+        )
+    return data
 
 
 def _is_sgcaptcha_error(err: Exception) -> bool:
@@ -193,7 +257,7 @@ try:
     BAK_DEFAULT_MODEL = config.get('AI', 'BAK_DEFAULT_MODEL', fallback=None) or None
 
     # WordPress 接口相关的常量配置
-    WP_DOMAIN = config.get('WordPress', 'WP_DOMAIN')
+    WP_DOMAIN = _normalize_wp_domain(config.get('WordPress', 'WP_DOMAIN'))
     WP_PRODUCT_URL = WP_DOMAIN+"/product/"
     WP_ABOUT_URL = WP_DOMAIN+"/junhao-clothing-streetwear/"
     WP_CONTACT_URL = WP_DOMAIN+"/contact/"
@@ -247,6 +311,17 @@ def ensure_wp_category(category_name: str) -> int:
             res_post.raise_for_status()
             new_cat = res_post.json()
             return new_cat.get('id')
+        except requests.exceptions.HTTPError as e:
+            term_id = _term_exists_id_from_http_error(e)
+            if term_id:
+                logger.warning(f"分类【{category_name}】已存在但创建接口返回 term_exists，复用 ID:{term_id}。")
+                return term_id
+            logger.warning(f"获取/创建分类【{category_name}】时 HTTP 异常 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
+            if attempt < 4:
+                time.sleep(2)
+            else:
+                logger.error(f"❌ 经过 5 次尝试获取/建分类依然失败。")
+                return None
         except Exception as e:
             logger.warning(f"获取/创建分类【{category_name}】时网络异常 (尝试 {attempt+1}/5): {e}")
             if attempt < 4:
@@ -459,6 +534,24 @@ async def _ensure_cat_with_parent(
             cat_id = created_payload.get("id") if isinstance(created_payload, dict) else None
             logger.info(f"  ✅ 分类【{name}】新建成功 ID:{cat_id}")
             break
+        except requests.exceptions.HTTPError as e:
+            term_id = _term_exists_id_from_http_error(e)
+            if term_id:
+                cat_cache[cache_key] = term_id
+                logger.warning(
+                    f"  ⚠️ 分类【{name}】已存在但创建接口返回 term_exists，"
+                    f"复用 ID:{term_id}，继续发布产品。"
+                )
+                return term_id
+            logger.warning(f"  新建分类【{name}】HTTP 异常 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
+            if _is_sgcaptcha_error(e):
+                logger.error("  ❌ 检测到站点启用了 SGCaptcha，分类创建接口被拦截。")
+                return None
+            if attempt < 4:
+                await asyncio.sleep(2)
+            else:
+                logger.error(f"  ❌ 新建分类【{name}】失败。")
+                return None
         except Exception as e:
             logger.warning(f"  新建分类【{name}】异常 (尝试 {attempt+1}/5): {e}")
             if _is_sgcaptcha_error(e):
@@ -698,8 +791,22 @@ def upload_wp_media(file_path: str):
             with open(file_path, "rb") as f:
                 res = requests.post(url, headers=headers, data=f, auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=60)
             res.raise_for_status()
-            data = _json_or_raise(res, f"上传图片 {filename}")
+            data = _json_object_or_raise(res, f"上传图片 {filename}")
             return data.get("id"), data.get("source_url")
+        except UnexpectedWPResponseError as e:
+            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
+            return None, None
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
+            resp = getattr(e, "response", None)
+            if _is_sgcaptcha_error(e) or (resp is not None and _looks_like_sgcaptcha(resp.text)):
+                logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
+                return None, None
+            if attempt < 4:
+                time.sleep(2)
+            else:
+                logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
+                return None, None
         except Exception as e:
             logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
             if _is_sgcaptcha_error(e):
@@ -1712,9 +1819,12 @@ async def main():
                         auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=15
                     )
                     res.raise_for_status()
-                    main_image_url = res.json().get("source_url", "")
+                    main_image_payload = _json_object_or_raise(res, f"获取主图 [{thumbnail_id}]")
+                    main_image_url = main_image_payload.get("source_url", "")
                     uploaded_images[0] = (thumbnail_id, main_image_url)
                     logger.info(f"    🔄 已补齐主图 URL: {main_image_url}")
+                except UnexpectedWPResponseError as e:
+                    logger.warning(f"无法获取主图 URL: {e}")
                 except Exception as e:
                     logger.warning(f"无法获取主图 URL: {e}")
             if len(uploaded_images) > 1:
