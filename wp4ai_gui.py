@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,18 @@ def _looks_like_sgcaptcha(payload: str) -> bool:
         or "/.well-known/sgcaptcha/" in text
         or "/.well-known/captcha/" in text
     )
+
+
+def _redact_ai_error_text(value: object, limit: int = 220) -> str:
+    """脱敏连接测试错误，防止代理回显完整 API key。"""
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(
+        r"(?i)(api[ _-]?key\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED_API_KEY]",
+        text,
+    )
+    return text[:limit]
 
 
 def detect_runtime_dir() -> str:
@@ -110,6 +123,7 @@ class SiteConfig:
     bak_default_model: str
     seo_min_score: str
     seo_max_retries: str
+    seo_system_prompt: str
     mode: str
 
     @staticmethod
@@ -130,6 +144,7 @@ class SiteConfig:
             bak_default_model="",
             seo_min_score="65",
             seo_max_retries="5",
+            seo_system_prompt="",
             mode="full",
         )
 
@@ -416,6 +431,7 @@ class WP4AIGui:
                     bak_default_model TEXT NOT NULL,
                     seo_min_score TEXT NOT NULL DEFAULT '65',
                     seo_max_retries TEXT NOT NULL DEFAULT '5',
+                    seo_system_prompt TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'full',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -427,6 +443,13 @@ class WP4AIGui:
                     value TEXT NOT NULL
                 )
             """)
+            site_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()
+            }
+            if "seo_system_prompt" not in site_columns:
+                conn.execute(
+                    "ALTER TABLE sites ADD COLUMN seo_system_prompt TEXT NOT NULL DEFAULT ''"
+                )
 
     def _db_get_setting(self, key: str, default_value: str) -> str:
         with self._db_connect() as conn:
@@ -557,6 +580,7 @@ class WP4AIGui:
         self.var_seo_min_score = tk.StringVar(value="65")
         self.var_seo_max_retries = tk.StringVar(value="5")
         self.var_mode = tk.StringVar(value="full")
+        self.seo_prompt_text = None
 
         row = 0
         ttk.Checkbutton(fields, text="启用该站点", variable=self.var_enabled).grid(row=row, column=0, sticky="w", padx=8, pady=6)
@@ -592,6 +616,23 @@ class WP4AIGui:
         self._grid_entry(fields, row, "SEO最低分（SEO_MIN_SCORE）", self.var_seo_min_score)
         row += 1
         self._grid_entry(fields, row, "SEO重试次数（SEO_MAX_RETRIES）", self.var_seo_max_retries)
+        row += 1
+
+        ttk.Label(fields, text="自定义SEO系统提示词（留空使用默认）").grid(
+            row=row, column=0, sticky="nw", padx=8, pady=6
+        )
+        prompt_frame = ttk.Frame(fields)
+        prompt_frame.grid(row=row, column=1, sticky="nsew", padx=8, pady=6)
+        prompt_frame.grid_columnconfigure(0, weight=1)
+        prompt_frame.grid_rowconfigure(0, weight=1)
+        self.seo_prompt_text = tk.Text(prompt_frame, height=8, wrap="word")
+        self.seo_prompt_text.grid(row=0, column=0, sticky="nsew")
+        prompt_scroll = ttk.Scrollbar(
+            prompt_frame, orient=tk.VERTICAL, command=self.seo_prompt_text.yview
+        )
+        prompt_scroll.grid(row=0, column=1, sticky="ns")
+        self.seo_prompt_text.configure(yscrollcommand=prompt_scroll.set)
+        fields.grid_rowconfigure(row, weight=1)
         row += 1
 
         ttk.Label(fields, text="运行模式").grid(row=row, column=0, sticky="w", padx=8, pady=6)
@@ -701,8 +742,9 @@ class WP4AIGui:
                         wp_domain, wp_username, wp_password,
                         ai_api_key, ai_base_url, default_model,
                         bak_ai_api_key, bak_ai_base_url, bak_default_model,
-                        seo_min_score, seo_max_retries, mode, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        seo_min_score, seo_max_retries, seo_system_prompt, mode,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(site_id) DO UPDATE SET
                         sort_order = excluded.sort_order,
                         enabled = excluded.enabled,
@@ -719,6 +761,7 @@ class WP4AIGui:
                         bak_default_model = excluded.bak_default_model,
                         seo_min_score = excluded.seo_min_score,
                         seo_max_retries = excluded.seo_max_retries,
+                        seo_system_prompt = excluded.seo_system_prompt,
                         mode = excluded.mode,
                         updated_at = excluded.updated_at
                 """, (
@@ -726,7 +769,8 @@ class WP4AIGui:
                     site.wp_domain, site.wp_username, site.wp_password,
                     site.ai_api_key, site.ai_base_url, site.default_model,
                     site.bak_ai_api_key, site.bak_ai_base_url, site.bak_default_model,
-                    site.seo_min_score, site.seo_max_retries, site.mode, created_at, now
+                    site.seo_min_score, site.seo_max_retries, site.seo_system_prompt,
+                    site.mode, created_at, now
                 ))
 
             if keep_ids:
@@ -788,6 +832,8 @@ class WP4AIGui:
         self.var_bak_default_model.set(site.bak_default_model)
         self.var_seo_min_score.set(site.seo_min_score)
         self.var_seo_max_retries.set(site.seo_max_retries)
+        self.seo_prompt_text.delete("1.0", tk.END)
+        self.seo_prompt_text.insert("1.0", site.seo_system_prompt)
         self.var_mode.set(site.mode)
         self.mode_combo.set(MODE_MAP.get(site.mode, MODE_MAP["full"]))
 
@@ -806,6 +852,7 @@ class WP4AIGui:
         site.bak_default_model = self.var_bak_default_model.get().strip()
         site.seo_min_score = self.var_seo_min_score.get().strip() or "65"
         site.seo_max_retries = self.var_seo_max_retries.get().strip() or "5"
+        site.seo_system_prompt = self.seo_prompt_text.get("1.0", "end-1c").strip()
         mode_raw = self.var_mode.get().strip().lower()
         site.mode = mode_raw if mode_raw in MODE_MAP else "full"
 
@@ -839,13 +886,21 @@ class WP4AIGui:
         except Exception:
             errs.append("SEO重试次数不是整数")
 
+        backup_fields = (
+            site.bak_ai_api_key.strip(),
+            site.bak_ai_base_url.strip(),
+            site.bak_default_model.strip(),
+        )
+        if any(backup_fields) and not all(backup_fields):
+            errs.append("备用AI配置必须同时填写密钥、地址和模型")
+
         if site.mode not in MODE_MAP:
             errs.append("运行模式无效")
 
         return len(errs) == 0, errs
 
     def write_temp_config(self, site: SiteConfig) -> str:
-        cp = configparser.ConfigParser()
+        cp = configparser.ConfigParser(interpolation=None)
         cp["AI"] = {
             "AI_API_KEY": site.ai_api_key,
             "AI_BASE_URL": site.ai_base_url,
@@ -862,6 +917,7 @@ class WP4AIGui:
         cp["SEO"] = {
             "SEO_MIN_SCORE": site.seo_min_score,
             "SEO_MAX_RETRIES": site.seo_max_retries,
+            "SEO_SYSTEM_PROMPT": site.seo_system_prompt,
         }
 
         fd, temp_path = tempfile.mkstemp(prefix="wp4ai_cfg_", suffix=".ini")
@@ -972,6 +1028,13 @@ class WP4AIGui:
             errs.append("主AI地址不能为空")
         if not site.default_model.strip():
             errs.append("主AI模型不能为空")
+        backup_fields = (
+            site.bak_ai_api_key.strip(),
+            site.bak_ai_base_url.strip(),
+            site.bak_default_model.strip(),
+        )
+        if any(backup_fields) and not all(backup_fields):
+            errs.append("备用AI配置必须同时填写密钥、地址和模型")
         return len(errs) == 0, errs
 
     def _test_wp_connection(self, site: SiteConfig) -> tuple[bool, str]:
@@ -1009,7 +1072,13 @@ class WP4AIGui:
         except Exception as e:
             return False, f"WordPress 连接异常: {e}"
 
-    def _test_ai_connection(self, label: str, base_url: str, api_key: str) -> tuple[bool, str]:
+    def _test_ai_connection(
+        self,
+        label: str,
+        base_url: str,
+        api_key: str,
+        model: str = "",
+    ) -> tuple[bool, str]:
         url = base_url.rstrip("/") + "/models"
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -1018,7 +1087,10 @@ class WP4AIGui:
         try:
             resp = requests.get(url, headers=headers, timeout=CONNECTION_TEST_TIMEOUT)
             if resp.status_code >= 400:
-                return False, f"{label} 连接失败，HTTP {resp.status_code}: {resp.text[:180]}"
+                return False, (
+                    f"{label} 连接失败，HTTP {resp.status_code}: "
+                    f"{_redact_ai_error_text(resp.text)}"
+                )
             model_count = 0
             try:
                 payload_raw = resp.json()
@@ -1026,11 +1098,21 @@ class WP4AIGui:
                 data = payload.get("data")
                 if isinstance(data, list):
                     model_count = len(data)
+                    model_ids = {
+                        str(item.get("id", "")).strip()
+                        for item in data
+                        if isinstance(item, dict) and str(item.get("id", "")).strip()
+                    }
+                    if model and model_ids and model not in model_ids:
+                        return False, (
+                            f"{label} 地址可连接，但模型 [{model}] 不在该地址返回的可用模型列表中；"
+                            "请检查模型名称与 base URL 是否属于同一服务商。"
+                        )
             except Exception:
                 model_count = 0
             return True, f"{label} 连接成功，可用模型数: {model_count}"
         except Exception as e:
-            return False, f"{label} 连接异常: {e}"
+            return False, f"{label} 连接异常: {_redact_ai_error_text(e)}"
 
     def _run_connection_test(self, site: SiteConfig):
         self.log_queue.put(("info", f"🔎 开始测试站点连接: {site.name}"))
@@ -1038,20 +1120,29 @@ class WP4AIGui:
         wp_ok, wp_msg = self._test_wp_connection(site)
         self.log_queue.put(("info" if wp_ok else "error", f"{'✅' if wp_ok else '❌'} {wp_msg}"))
 
-        ai_ok, ai_msg = self._test_ai_connection("主AI", site.ai_base_url, site.ai_api_key)
+        ai_ok, ai_msg = self._test_ai_connection(
+            "主AI", site.ai_base_url, site.ai_api_key, site.default_model
+        )
         self.log_queue.put(("info" if ai_ok else "error", f"{'✅' if ai_ok else '❌'} {ai_msg}"))
 
         # 备用 AI 仅在配置完整时测试
         bak_key = site.bak_ai_api_key.strip()
         bak_url = site.bak_ai_base_url.strip()
         bak_model = site.bak_default_model.strip()
+        bak_ok = True
         if bak_key and bak_url and bak_model:
-            bak_ok, bak_msg = self._test_ai_connection("备用AI", bak_url, bak_key)
+            bak_ok, bak_msg = self._test_ai_connection(
+                "备用AI", bak_url, bak_key, bak_model
+            )
             self.log_queue.put(("info" if bak_ok else "error", f"{'✅' if bak_ok else '❌'} {bak_msg}"))
         else:
-            self.log_queue.put(("warn", "⚠️ 备用AI配置不完整，已跳过备用AI连接测试。"))
+            if any((bak_key, bak_url, bak_model)):
+                bak_ok = False
+                self.log_queue.put(("error", "❌ 备用AI配置不完整，无法进行备用AI连接测试。"))
+            else:
+                self.log_queue.put(("warn", "⚠️ 未配置备用AI，已跳过备用AI连接测试。"))
 
-        if wp_ok and ai_ok:
+        if wp_ok and ai_ok and bak_ok:
             self.log_queue.put(("info", "🎉 当前站点连接测试通过。"))
         else:
             self.log_queue.put(("warn", "⚠️ 当前站点连接测试未完全通过，请根据日志修正配置。"))

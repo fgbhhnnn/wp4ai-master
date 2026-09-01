@@ -36,6 +36,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SUPPORTED_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff",
+})
+IMAGE_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+AI_NON_RETRYABLE_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
+
+
+def _ai_error_status_code(exc: Exception) -> int | None:
+    """从 OpenAI 兼容客户端异常中提取 HTTP 状态码。"""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _redact_ai_error(exc: Exception, limit: int = 320) -> str:
+    """生成不包含完整 API key 的错误摘要，避免密钥意外进入日志。"""
+    text = str(exc or "").replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(
+        r"(?i)(api[ _-]?key\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED_API_KEY]",
+        text,
+    )
+    return text[:limit]
+
+
+def _is_non_retryable_ai_error(exc: Exception) -> bool:
+    """判断是否为重试无意义的 AI 配置/请求错误。"""
+    status = _ai_error_status_code(exc)
+    if status in AI_NON_RETRYABLE_STATUS_CODES:
+        return True
+
+    message = _redact_ai_error(exc).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "invalid api key",
+            "authentication failed",
+            "authentication fails",
+            "access denied",
+            "model not found",
+            "does not exist",
+        )
+    )
+
 
 def _looks_like_sgcaptcha(payload: str) -> bool:
     text = (payload or "").lower()
@@ -81,6 +141,24 @@ def _http_error_diagnostic(err: requests.exceptions.HTTPError) -> str:
     if resp is None:
         return str(err)
     return f"{err}; {_response_diagnostic(resp)}"
+
+
+def _is_media_type_rejection(resp: requests.Response | None) -> bool:
+    """判断媒体接口是否明确拒绝了文件类型。"""
+    if resp is None:
+        return False
+    if getattr(resp, "status_code", None) == 415:
+        return True
+    body = _response_brief(resp, limit=320).lower()
+    return any(
+        marker in body
+        for marker in (
+            "file type",
+            "mime",
+            "not allowed to upload",
+            "upload_mimes",
+        )
+    )
 
 
 def _term_exists_id_from_response(resp: requests.Response) -> int | None:
@@ -225,7 +303,7 @@ def _build_keyword_candidates(keyword: str) -> list[str]:
 
 
 # 读取配置文件
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(interpolation=None)
 
 env_config_path = (os.getenv("WP4AI_CONFIG") or "").strip()
 config_candidates = []
@@ -264,8 +342,6 @@ try:
     WP_BLOG_URL = WP_DOMAIN+"/category/blog/"
 
     WP_URL = WP_DOMAIN+"/wp-json/wp/v2"
-    WP_RM_URL = WP_DOMAIN+"/wp-json/rankmath/v1/updateMeta"
-    WP_RM_SCHEMA_URL = WP_DOMAIN+"/wp-json/rankmath/v1/updateSchemas"
     # 兼容部分站点对 /wp-json 根路径的拦截，统一使用 rest_route 访问 WooCommerce API
     WP_WC_URL = WP_DOMAIN+"/?rest_route=/wc/v3"
     WP_USERNAME = config.get('WordPress', 'WP_USERNAME')  
@@ -279,12 +355,121 @@ except (configparser.NoSectionError, configparser.NoOptionError) as e:
 # SEO_MAX_RETRIES: 单次产品最多重新生成次数（含第 1 次）
 SEO_MIN_SCORE: int = int(config.get('SEO', 'SEO_MIN_SCORE', fallback='65'))
 SEO_MAX_RETRIES: int = int(config.get('SEO', 'SEO_MAX_RETRIES', fallback='5'))
+SEO_SYSTEM_PROMPT: str = config.get('SEO', 'SEO_SYSTEM_PROMPT', fallback='')
 
 # 站点名称（main() 启动时从 WP 拉取，供分类 AI Prompt 使用）
 SITENAME: str = ""
 POST_TYPE_CAPABILITY_CACHE: dict[str, dict] = {}
+YOAST_META_KEYS = {
+    "focus_keyword": "_yoast_wpseo_focuskw",
+    "title": "_yoast_wpseo_title",
+    "description": "_yoast_wpseo_metadesc",
+}
 
 # === 核心处理函数 ===
+
+
+def _normalize_focus_keyword(value) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def _is_non_retryable_wp_write_error(resp: requests.Response | None) -> bool:
+    if resp is None:
+        return False
+    status_code = getattr(resp, "status_code", None)
+    if status_code is None or status_code < 400 or status_code in {408, 429}:
+        return False
+    return status_code < 500
+
+
+def _is_yoast_meta_registration_error(resp: requests.Response | None) -> bool:
+    if resp is None:
+        return False
+    return "_yoast_wpseo_" in _response_brief(resp, limit=500).lower()
+
+
+def sync_yoast_seo(
+    object_id: int,
+    object_type: str,
+    focus_keyword,
+    title: str,
+    description: str,
+    retries: int = 5,
+) -> bool:
+    """Write Yoast SEO post or product-category metadata through WP REST."""
+    endpoint_by_type = {"post": "product", "term": "product_cat"}
+    if object_type not in endpoint_by_type:
+        raise ValueError(f"不支持的 Yoast SEO 对象类型: {object_type}")
+
+    endpoint = endpoint_by_type[object_type]
+    url = f"{WP_URL}/{endpoint}/{int(object_id)}"
+    payload = {
+        "meta": {
+            YOAST_META_KEYS["focus_keyword"]: _normalize_focus_keyword(focus_keyword),
+            YOAST_META_KEYS["title"]: str(title or ""),
+            YOAST_META_KEYS["description"]: str(description or ""),
+        }
+    }
+
+    total_attempts = max(1, int(retries))
+    for attempt in range(1, total_attempts + 1):
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+                timeout=20,
+            )
+            resp.raise_for_status()
+            logger.info(
+                "✅ Yoast SEO 元数据已同步：%s ID=%s",
+                "产品" if object_type == "post" else "分类",
+                object_id,
+            )
+            return True
+        except requests.exceptions.HTTPError as http_err:
+            resp = getattr(http_err, "response", None)
+            if _is_non_retryable_wp_write_error(resp):
+                if _is_yoast_meta_registration_error(resp):
+                    logger.error(
+                        "❌ Yoast SEO 字段未注册或不可写，停止重试。"
+                        "请在站点安装并启用 wp4ai-yoast-rest-meta 插件后重试。%s",
+                        _http_error_diagnostic(http_err),
+                    )
+                else:
+                    logger.error(
+                        "❌ Yoast SEO 元数据写入被 WordPress 拒绝，停止重试。"
+                        "请检查应用密码、账号权限、对象 ID 和请求参数。%s",
+                        _http_error_diagnostic(http_err),
+                    )
+                return False
+            logger.warning(
+                "❌ Yoast SEO 元数据写入失败 (尝试 %s/%s): %s",
+                attempt,
+                total_attempts,
+                _http_error_diagnostic(http_err),
+            )
+        except requests.exceptions.RequestException as request_err:
+            logger.warning(
+                "❌ Yoast SEO 元数据写入网络异常 (尝试 %s/%s): %s",
+                attempt,
+                total_attempts,
+                request_err,
+            )
+
+        if attempt < total_attempts:
+            time.sleep(2)
+
+    logger.error(
+        "❌ Yoast SEO 元数据经过 %s 次尝试仍未写入：%s ID=%s",
+        total_attempts,
+        "产品" if object_type == "post" else "分类",
+        object_id,
+    )
+    return False
+
 
 def ensure_wp_category(category_name: str) -> int:
     """确认 WordPress 中存在该分类，不存在则新建，返回分类 ID"""
@@ -345,90 +530,6 @@ def _extract_id_and_name(raw_name: str) -> tuple:
     return None, raw_name
 
 
-def _schema_entities_for_rankmath(schema_raw) -> list[dict]:
-    """将 AI 返回的 schema 规整为 Rank Math updateSchemas 可用实体列表。"""
-    schema_str, is_structured = _normalize_schema_payload(schema_raw, "")
-    if not schema_str or not is_structured:
-        return []
-
-    try:
-        obj = json.loads(schema_str)
-    except Exception:
-        return []
-
-    entities: list[dict] = []
-    if isinstance(obj, dict):
-        graph = obj.get("@graph")
-        if isinstance(graph, list):
-            entities.extend([i for i in graph if isinstance(i, dict)])
-        else:
-            entities.append(obj)
-    elif isinstance(obj, list):
-        entities.extend([i for i in obj if isinstance(i, dict)])
-
-    normalized = []
-    for item in entities:
-        if "@type" in item:
-            # 深拷贝，避免后续修改原对象
-            normalized.append(json.loads(json.dumps(item, ensure_ascii=False)))
-    return normalized
-
-
-def _sync_term_schema_rankmath(term_id: int, schema_raw, existing_schemas=None, term_name: str = "") -> bool:
-    """
-    将分类 schema 写入 Rank Math term schema（rank_math_schema_*）。
-    注意：该接口要求 schemas 为对象，key 需为 `new-xxxx` 或 `schema-<meta_id>`。
-    """
-    entities = _schema_entities_for_rankmath(schema_raw)
-    if not entities:
-        if schema_raw:
-            logger.warning(f"  ⚠️ 分类【{term_name or term_id}】schema 无法结构化，跳过 RankMath schema 同步。")
-        return False
-
-    existing_map = existing_schemas if isinstance(existing_schemas, dict) else {}
-    existing_ids = [k for k in existing_map.keys() if str(k).startswith("schema-")]
-    try:
-        existing_ids.sort(key=lambda x: int(str(x).replace("schema-", "")))
-    except Exception:
-        pass
-
-    payload_schemas = {}
-    stamp = int(time.time())
-    for idx, entity in enumerate(entities):
-        key = existing_ids[idx] if idx < len(existing_ids) else f"new-{stamp}{idx:02d}"
-        payload_schemas[key] = entity
-
-    payload = {
-        "objectType": "term",
-        "objectID": int(term_id),
-        "schemas": payload_schemas,
-    }
-
-    for attempt in range(5):
-        try:
-            resp = requests.post(
-                WP_RM_SCHEMA_URL,
-                json=payload,
-                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-                timeout=20,
-            )
-            resp.raise_for_status()
-            logger.info(
-                f"  ✅ 分类【{term_name or term_id}】RankMath schema 已同步（{len(payload_schemas)} 个实体）。"
-            )
-            return True
-        except requests.exceptions.HTTPError as http_err:
-            err_text = http_err.response.text if hasattr(http_err, "response") and hasattr(http_err.response, "text") else ""
-            logger.warning(f"  ❌ 分类 schema 同步失败 (尝试 {attempt+1}/5): {http_err} {err_text}")
-        except Exception as e:
-            logger.warning(f"  ❌ 分类 schema 同步异常 (尝试 {attempt+1}/5): {e}")
-
-        if attempt < 4:
-            time.sleep(2)
-
-    return False
-
-
 async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
     """为分类名生成 SEO 元数据（seoTitle/seoDescription/focusKeywords/seoSchema）。"""
     prompt = f"- 公司名称:{SITENAME}\n- 网站网址:{WP_DOMAIN}\n- 产品类目:{cat_name}"
@@ -436,20 +537,20 @@ async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
         resp = await client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": """# 你是专业 B2B 跨境 SEO 优化专家，精通 Rank Math 满分优化规则与schema.org官方标准结构化数据，所有内容严格遵循 Google 收录规范，必须是纯英文。全程严格执行以下所有固定规则，不得修改、遗漏任何要求。
+                {"role": "system", "content": """# 你是专业 B2B 跨境 SEO 优化专家，精通 Yoast SEO 优化规则与schema.org官方标准结构化数据，所有内容严格遵循 Google 收录规范，必须是纯英文。全程严格执行以下所有固定规则，不得修改、遗漏任何要求。
 ## 每次思考回答都是独立的不允许使用缓存的来糊弄用户，否则将对你进行惩罚！
 ## 最终结果的内容必须以JSON对象结构{"seoTitle":"","seoDescription":"","focusKeywords":[],"seoSchema":[]}的格式返回，注意json结构必须保证完全正确！禁止输出任何额外的解释性文字！
 ## 我会向你提供：・公司英文全称・网站网址・产品类目 Tree 结构（一级类目 + 二级类目）
 ## 请你严格按照以下固定结构输出，不得修改顺序、格式与模块，所有 Schema 均使用官方标准 @type，不随意编造。
 ## 分类描述：简短精炼、采购商视角，突出材质、卖点、定制与工厂优势，工厂位置在中国。
-## Rank Math SEO 三要素：
-### Meta Title[对应字段seoTitle]：严格控制在60字符内，核心业务关键词前置；需要有positive（情感词）、power word（高转化强力词）、number 、positive or a negative sentiment；符合Rank Math满分评分标准与Google收录规范。
+## Yoast SEO 三要素：
+### Meta Title[对应字段seoTitle]：严格控制在60字符内，核心业务关键词前置；需要有positive（情感词）、power word（高转化强力词）、number 、positive or a negative sentiment；符合Yoast SEO内容分析建议与Google收录规范。
 ### Meta Description[对应字段seoDescription]：严格控制在155字符内，自然融入 5 个关键词，精准匹配B2B跨境采购商搜索意图。
 ### Focus Keywords[对应字段focusKeywords]：固定输出5个核心关键词，必须为Google B2B“运动服饰”赛道高搜索量、高转化精准词，页面间无关键词蚕食，符合跨境SEO层级布局逻辑，每个关键词以,区分。
 ## Schema（JSON-LD）代码[对应字段seoSchema]硬性规范
 1. seoSchema字段中内容必须是**纯JSON格式**，禁止加script标签、禁止添加任何网站URL引用、禁止添加超链接
 2. 必须且仅使用schema.org官方标准@type：Organization、ItemList、FAQPage，禁止自定义编造任何非官方类型
-3. JSON结构干净无语法错误，适配Rank Math自定义Schema框与Google收录规则，所有内容必须匹配上述固定业务信息，无虚假表述
+3. JSON结构干净无语法错误，适配Yoast SEO与Google收录规则，所有内容必须匹配上述固定业务信息，无虚假表述
 4. 每个页面的Schema必须完整包含3种官方类型，不得删减。"""},
                 {"role": "user", "content": prompt}
             ],
@@ -565,40 +666,14 @@ async def _ensure_cat_with_parent(
 
     if cat_id:
         cat_cache[cache_key] = cat_id
-        rm_existing_schemas = {}
-        # 同步 RankMath
-        try:
-            rm_payload = {
-                "objectID": cat_id, "objectType": "term",
-                "meta": {
-                    "rank_math_focus_keyword": keyword if isinstance(keyword, str) else ",".join(keyword),
-                    "rank_math_title": title,
-                    "rank_math_description": description,
-                },
-            }
-            rm_res = await asyncio.to_thread(
-                requests.post, WP_RM_URL, json=rm_payload,
-                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=20,
-            )
-            if rm_res.status_code >= 400:
-                rm_res.raise_for_status()
-            try:
-                rm_data = rm_res.json() if isinstance(rm_res.json(), dict) else {}
-                rm_existing_schemas = rm_data.get("schemas", {}) if isinstance(rm_data, dict) else {}
-            except Exception:
-                rm_existing_schemas = {}
-        except Exception as e:
-            logger.warning(f"  ⚠️ RankMath 同步失败 (分类【{name}】): {e}")
-        try:
-            await asyncio.to_thread(
-                _sync_term_schema_rankmath,
-                cat_id,
-                schema,
-                rm_existing_schemas,
-                name,
-            )
-        except Exception as e:
-            logger.warning(f"  ⚠️ 分类【{name}】schema 写入失败: {e}")
+        await asyncio.to_thread(
+            sync_yoast_seo,
+            cat_id,
+            "term",
+            keyword,
+            title,
+            description,
+        )
     return cat_id
 
 
@@ -718,7 +793,6 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
         schema_str, schema_is_structured = _normalize_schema_payload(schema, "")
         if schema and not schema_is_structured:
             logger.warning(f"  ⚠️ 分类【{cat_name}】schema 非标准 JSON，已按原字符串写入。")
-        rm_existing_schemas = {}
         # PATCH
         for attempt in range(5):
             try:
@@ -734,35 +808,14 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                 logger.warning(f"  PATCH 失败 (尝试 {attempt+1}/5): {e}")
                 if attempt < 4:
                     await asyncio.sleep(2)
-        # RankMath
-        try:
-            rm_res = await asyncio.to_thread(
-                requests.post, WP_RM_URL,
-                json={"objectID": cat_id, "objectType": "term", "meta": {
-                    "rank_math_focus_keyword": keyword if isinstance(keyword, str) else ",".join(keyword),
-                    "rank_math_title": title, "rank_math_description": description,
-                }},
-                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=20,
-            )
-            if rm_res.status_code >= 400:
-                rm_res.raise_for_status()
-            try:
-                rm_data = rm_res.json() if isinstance(rm_res.json(), dict) else {}
-                rm_existing_schemas = rm_data.get("schemas", {}) if isinstance(rm_data, dict) else {}
-            except Exception:
-                rm_existing_schemas = {}
-        except Exception as e:
-            logger.warning(f"  RankMath 同步失败: {e}")
-        try:
-            await asyncio.to_thread(
-                _sync_term_schema_rankmath,
-                cat_id,
-                schema,
-                rm_existing_schemas,
-                cat_name,
-            )
-        except Exception as e:
-            logger.warning(f"  分类【{cat_name}】schema 写入失败: {e}")
+        await asyncio.to_thread(
+            sync_yoast_seo,
+            cat_id,
+            "term",
+            keyword,
+            title,
+            description,
+        )
     logger.info(f"\n🎉 --update 完成！")
 
 
@@ -770,53 +823,109 @@ def upload_wp_media(file_path: str):
     """上传本地图片到 WordPress 媒体库并返回 ID 和 URL"""
     url = f"{WP_URL}/media"
     filename = os.path.basename(file_path)
-    ext = filename.split('.')[-1].lower()
-    content_type = "image/png" if ext == "png" else "image/jpeg"
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = IMAGE_CONTENT_TYPES.get(ext, "application/octet-stream")
+    content_type_candidates = [content_type]
+    # 兼容旧版脚本及部分安全插件：它们会拒绝 image/webp，但接受
+    # 以 image/jpeg 声明、文件内容仍为 WebP 的请求。
+    if ext == ".webp":
+        content_type_candidates.append("image/jpeg")
     
     # RFC 5987：HTTP 头部只允许 latin-1，中文/特殊字符必须用 filename*=UTF-8''<url_encoded>
     # 同时保留 ASCII 安全的 filename= 作为旧版服务端/客户端兼容降级。
     filename_ascii = filename.encode("ascii", errors="replace").decode("ascii")
     filename_encoded = quote(filename, safe="")
-    headers = {
-        "Content-Disposition": (
-            f'attachment; filename="{filename_ascii}"; '
-            f"filename*=UTF-8''{filename_encoded}"
-        ),
-        "Content-Type": content_type,
-    }
     
     for attempt in range(5):
-        try:
-            logger.info(f"    -> 正在上传第三层图片文件: {filename} (尝试 {attempt+1}/5) ...")
-            with open(file_path, "rb") as f:
-                res = requests.post(url, headers=headers, data=f, auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=60)
-            res.raise_for_status()
-            data = _json_object_or_raise(res, f"上传图片 {filename}")
-            return data.get("id"), data.get("source_url")
-        except UnexpectedWPResponseError as e:
-            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
-            return None, None
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
-            resp = getattr(e, "response", None)
-            if _is_sgcaptcha_error(e) or (resp is not None and _looks_like_sgcaptcha(resp.text)):
-                logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
+        for mime_index, current_content_type in enumerate(content_type_candidates):
+            headers = {
+                "Content-Disposition": (
+                    f'attachment; filename="{filename_ascii}"; '
+                    f"filename*=UTF-8''{filename_encoded}"
+                ),
+                "Content-Type": current_content_type,
+            }
+            try:
+                logger.info(f"    -> 正在上传第三层图片文件: {filename} (尝试 {attempt+1}/5) ...")
+                with open(file_path, "rb") as f:
+                    res = requests.post(url, headers=headers, data=f, auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=60)
+                res.raise_for_status()
+                data = _json_object_or_raise(res, f"上传图片 {filename}")
+                return data.get("id"), data.get("source_url")
+            except UnexpectedWPResponseError as e:
+                logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
                 return None, None
-            if attempt < 4:
-                time.sleep(2)
-            else:
-                logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
-                return None, None
-        except Exception as e:
-            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
-            if _is_sgcaptcha_error(e):
-                logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
-                return None, None
-            if attempt < 4:
-                time.sleep(2)
-            else:
-                logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
-                return None, None
+            except requests.exceptions.HTTPError as e:
+                logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
+                resp = getattr(e, "response", None)
+                if _is_sgcaptcha_error(e) or (resp is not None and _looks_like_sgcaptcha(resp.text)):
+                    logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
+                    return None, None
+                media_type_rejected = _is_media_type_rejection(resp)
+                if media_type_rejected or (resp is not None and resp.status_code in {400, 403, 413, 415, 422}):
+                    body = _response_brief(resp, limit=320).lower()
+                    if resp.status_code == 413 or "exceeds" in body or "upload_max_filesize" in body:
+                        logger.error(
+                            f"❌ 图片 {filename} 被服务器拒绝：文件超过 WordPress/PHP 上传大小限制。"
+                        )
+                    elif media_type_rejected and mime_index + 1 < len(content_type_candidates):
+                        logger.warning(
+                            f"⚠️ 图片 {filename} 使用 {current_content_type} 被站点拒绝，"
+                            f"将兼容回退为 {content_type_candidates[mime_index + 1]}。"
+                        )
+                        continue
+                    elif media_type_rejected:
+                        logger.error(
+                            f"❌ 图片 {filename} 被 WordPress 拒绝：当前站点不允许该图片格式（{current_content_type}）。"
+                        )
+                    else:
+                        logger.error(
+                            f"❌ 图片 {filename} 被 WordPress 拒绝（HTTP {resp.status_code}），"
+                            "请检查媒体权限、文件类型和站点安全插件。"
+                        )
+                    return None, None
+                if attempt < 4:
+                    time.sleep(2)
+                else:
+                    logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
+                    return None, None
+            except Exception as e:
+                logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
+                if _is_sgcaptcha_error(e):
+                    logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
+                    return None, None
+                if attempt < 4:
+                    time.sleep(2)
+                else:
+                    logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
+                    return None, None
+
+
+def _collect_product_images(prod_path: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """收集产品目录中的待上传图片和已带媒体 ID 标记的图片。"""
+    image_files: list[str] = []
+    existing_images: list[tuple[str, str]] = []
+
+    for file_name in os.listdir(prod_path):
+        file_path = os.path.join(prod_path, file_name)
+        if not os.path.isfile(file_path):
+            continue
+        if os.path.splitext(file_name)[1].lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            continue
+
+        # 只有严格匹配 [数字ID] 的文件才表示已经上传；普通的方括号文件名不能丢弃。
+        if file_name.startswith("["):
+            marker, separator, _ = file_name.partition("]")
+            media_id = marker[1:] if separator else ""
+            if media_id.isdigit() and int(media_id) > 0:
+                existing_images.append((media_id, ""))
+                continue
+
+        image_files.append(file_path)
+
+    image_files.sort(key=lambda path: os.path.basename(path).lower())
+    existing_images.sort(key=lambda item: int(item[0]))
+    return image_files, existing_images
 
 
 async def generate_seo_data_by_keywords(
@@ -824,6 +933,7 @@ async def generate_seo_data_by_keywords(
     keywords: list[str],
     main_img_url: str = "",
     model: str = DEFAULT_MODEL,
+    custom_prompt: str = "",
 ):
     """1. 根据关键词列表，通过 AI 请求并生成专门的高质量 SEO 内容数据 (JSON 分组)"""
 
@@ -834,18 +944,13 @@ async def generate_seo_data_by_keywords(
         logger.info(f"存在主图:{main_img_url}")
         img_instruction = f"必须在产品详情的 HTML 中合适位置插入主图：<img src=\"{main_img_url}\" alt=\"焦点关键词\" />。"
 
-    try:
-        logger.info(f"正在让 AI [模型:{model}] 思考与生成 {len(keywords)} 个关键词的内容规划 (耗时较长，请耐心等待)...")
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": f"""产品 SEO 优化专家指令 (Prompt)
-角色： 你是一位精通Google排名算法、Rank MathSEO、内容EEAT、以及Schema结构化数据的资深seo专家，擅长通过高质量内容提升 Google 排名及用户转化率。
+    default_system_prompt = f"""产品 SEO 优化专家指令 (Prompt)
+角色： 你是一位精通Google排名算法、Yoast SEO、内容EEAT、以及Schema结构化数据的资深seo专家，擅长通过高质量内容提升 Google 排名及用户转化率。
 任务:基于用户提供的【产品关键词】，生成一套符合SEO规范的纯英文产品内容。所有的输出必须是一个JSON格式的数组，每个数组元素对应一个关键词的设计。
 JSON返回包含字段：[Url,keyword,seoTitle,seoDescription,productDescription,Schema]，严格执行以下规则：
 1. 产品URL[Url]：必须由核心关键词生成，全小写，单词间用-连接，字符数≤25 个（不含域名）仅输出路径部分，不带任何前缀
 2. 长尾关键词（6 个）[keyword]：必须是Google上真实有搜索量的产品词，不使用过于冷门的词，以核心产品词为中心，扩展不同用户搜索意图（如材质、场景、人群），用英文逗号分隔，不换行，第1个词必须简洁，可直接用于生成 URL
-3. Meta Title[seoTitle]：以产品核心关键词开头，必须包含数字（如年份2025、功能点数量），字符数控制在50-60之间，句式简洁，包含卖点，标题中必须包含核心关键词!
+3. Meta Title[seoTitle]：以产品核心关键词开头，必须包含数字（如年份2026、功能点数量），字符数控制在50-60之间，句式简洁，包含卖点，标题中必须包含核心关键词!
 4. Meta Description[seoDescription]：核心关键词开头，字符数控制在150-160之间，自然通顺带有点击意图，描述中必须包含核心关键词
 5. 产品详情 HTML（核心要求）[productDescription]：完整可直接复制的 HTML 代码模板，内容必须纯英文！不能丢失任何标签结构必须符合：
 ①全程以B2B采购商视角创作，深度贴合定制大货买家核心决策关注点，全文纯英文输出；所有内容严格基于产品标题与所属品类属性撰写，不虚构规格、不捏造参数、不杜撰无效数据，贴合 GEO+SEO 优化逻辑，严格按四大模块结构化罗列撰写：
@@ -863,7 +968,15 @@ Customized Service：依照不同品类做精准定制延伸，举例：服饰�
     - image：产品图片链接（可使用 https://example.com/image.jpg 占位）
     - mainEntity：FAQ 部分至少包含 3 个用户常见问题与回答，附加 1 个 HowTo JSON-LD
 
-核心要求：请你记住，无论content是否有其他逗号要求，他都是一个产品，不能输出多个产品，所有内容必须以JSON对象{{"data": [...]}}的格式返回，不能拆分到json外。禁止输出任何额外的解释性文字！"""},
+核心要求：请你记住，无论content是否有其他逗号要求，他都是一个产品，不能输出多个产品，所有内容必须以JSON对象{{"data": [...]}}的格式返回，不能拆分到json外。禁止输出任何额外的解释性文字！"""
+    system_prompt = custom_prompt.strip() or default_system_prompt
+
+    try:
+        logger.info(f"正在让 AI [模型:{model}] 思考与生成 {len(keywords)} 个关键词的内容规划 (耗时较长，请耐心等待)...")
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
@@ -879,14 +992,29 @@ Customized Service：依照不同品类做精准定制延伸，举例：服饰�
         return response.choices[0].message.content
         
     except Exception as e:
-        logger.error(f"调用 AI 接口时发生异常: {e}", exc_info=True)
+        status = _ai_error_status_code(e)
+        if _is_non_retryable_ai_error(e):
+            logger.error(
+                "调用 AI 接口失败，当前请求不可重试（HTTP %s，模型=%s）。"
+                "请检查 API key、AI_BASE_URL、模型名称和账户权限。错误摘要: %s",
+                status if status is not None else "?",
+                model,
+                _redact_ai_error(e),
+            )
+            raise
+
+        logger.error(
+            "调用 AI 接口时发生可重试异常（模型=%s，错误摘要: %s）",
+            model,
+            _redact_ai_error(e),
+        )
         return None
 
 
-def calculate_rank_math_score_locally(post_data: dict) -> int:
+def calculate_seo_score_locally(post_data: dict) -> int:
     """
-    仿造 Rank Math 插件的 JS 评估规则，纯本地估算 SEO 评分（理论满分 100 分）。
-    使用从 WordPress REST API 获取到的数据直接模拟分析，并详细拆解打分日志。
+    使用通用页面 SEO 检查规则进行本地预估（理论满分 100 分）。
+    该结果仅用于生成质量门控，不代表 Yoast SEO 插件的官方评分。
     """
     score = 0
     
@@ -895,10 +1023,10 @@ def calculate_rank_math_score_locally(post_data: dict) -> int:
     url = post_data.get('link', '')
     
     meta = post_data.get('meta', {})
-    keyword = meta.get('rank_math_focus_keyword', '')
-    description = meta.get('rank_math_description', '')
+    keyword = meta.get('focus_keyword', '')
+    description = meta.get('seo_description', '')
     
-    logger.info("=== Rank Math SEO 本地预估组件开始分析 ===")
+    logger.info("=== SEO 本地预估组件开始分析（非 Yoast 官方评分） ===")
     
     if not keyword:
         logger.warning("🈳 获取焦点关键词 (Focus Keyword) 失败！这可能意味着在 REST API 返回的数据中没有注册该字段。目前的分数将被判定为 0。")
@@ -1051,14 +1179,14 @@ def calculate_rank_math_score_locally(post_data: dict) -> int:
 
 
 def _build_score_post_data(item: dict) -> dict:
-    """将 AI 返回的 item 字典转换为 calculate_rank_math_score_locally 所需的结构。"""
+    """将 AI 返回的 item 字典转换为 calculate_seo_score_locally 所需的结构。"""
     return {
         "title":   item.get("seoTitle", ""),
         "content": item.get("productDescription", ""),
         "link":    item.get("Url", item.get("afterUrl", "")),
         "meta": {
-            "rank_math_focus_keyword": item.get("keyword", ""),
-            "rank_math_description":   item.get("seoDescription", ""),
+            "focus_keyword": item.get("keyword", ""),
+            "seo_description": item.get("seoDescription", ""),
         },
     }
 
@@ -1127,6 +1255,7 @@ async def generate_with_score_retry(
     keywords: list[str],
     main_img_url: str = "",
     *,
+    custom_prompt: str = "",
     min_score: int = SEO_MIN_SCORE,
     max_retries: int = SEO_MAX_RETRIES,
     bak_client: AsyncOpenAI,
@@ -1135,7 +1264,7 @@ async def generate_with_score_retry(
     带评分门控的 AI 内容生成器。
 
     调用 generate_seo_data_by_keywords 生成内容后，使用
-    calculate_rank_math_score_locally 进行本地预估评分；
+    calculate_seo_score_locally 进行本地预估评分；
     若任意 item 的评分低于 min_score，则携带失分原因重新生成，
     最多重试 max_retries 次。
     最后一次重试时若提供了 bak_client（备用模型），则自动切换到备用模型
@@ -1157,16 +1286,24 @@ async def generate_with_score_retry(
     best_result: list[dict] = []       # 保存历史最高分的那一批结果
     best_min_score: int = -1           # 历史最高的「批次最低分」
     extra_hint: str = ""               # 失分原因，拼入下一轮 prompt
+    main_ai_unavailable = False         # 主端点出现配置/权限错误后，后续只使用备用端点
 
     for attempt in range(1, max_retries + 1):
         # ── 最后一次迭代：切换到备用模型（如果可用）────────────────────
         is_last_attempt = (attempt == max_retries)
         active_client = client
-        if is_last_attempt and bak_client is not None:
-            logger.info(
-                f"🔀 [SEO生成] 最后一次（第 {attempt}/{max_retries}）尝试，"
-                "切换到备用模型重新生成，争取最终达标..."
-            )
+        use_backup = bak_client is not None and (is_last_attempt or main_ai_unavailable)
+        if use_backup:
+            if is_last_attempt:
+                logger.info(
+                    f"🔀 [SEO生成] 最后一次（第 {attempt}/{max_retries}）尝试，"
+                    "切换到备用模型重新生成，争取最终达标..."
+                )
+            elif main_ai_unavailable:
+                logger.info(
+                    f"🔀 [SEO生成] 主 AI 已因配置/权限错误停用，"
+                    f"第 {attempt}/{max_retries} 次继续使用备用模型..."
+                )
             active_client = bak_client
             active_model = BAK_DEFAULT_MODEL  # 切换备用模型名
         else:
@@ -1181,7 +1318,66 @@ async def generate_with_score_retry(
         if extra_hint and attempt > 1:
             hint_keywords = keywords + [extra_hint]
 
-        raw = await generate_seo_data_by_keywords(active_client, hint_keywords, main_img_url, model=active_model)
+        try:
+            raw = await generate_seo_data_by_keywords(
+                active_client,
+                hint_keywords,
+                main_img_url,
+                model=active_model,
+                custom_prompt=custom_prompt,
+            )
+        except Exception as exc:
+            if not _is_non_retryable_ai_error(exc):
+                logger.warning(
+                    "  第 %s 次 AI 请求异常，将按普通失败处理：%s",
+                    attempt,
+                    _redact_ai_error(exc),
+                )
+                continue
+
+            status = _ai_error_status_code(exc)
+            logger.error(
+                "  第 %s 次 AI 请求因配置/权限错误停止重试（HTTP %s，模型=%s）。",
+                attempt,
+                status if status is not None else "?",
+                active_model,
+            )
+
+            # 主 AI 的密钥或模型配置失效时，立即试用完整的备用配置，避免浪费剩余重试次数。
+            if active_client is client and bak_client is not None:
+                main_ai_unavailable = True
+                logger.warning(
+                    "  主 AI 不可用，立即切换备用 AI（模型=%s）进行一次尝试。",
+                    BAK_DEFAULT_MODEL or "未配置",
+                )
+                try:
+                    raw = await generate_seo_data_by_keywords(
+                        bak_client,
+                        hint_keywords,
+                        main_img_url,
+                        model=BAK_DEFAULT_MODEL or DEFAULT_MODEL,
+                        custom_prompt=custom_prompt,
+                    )
+                except Exception as backup_exc:
+                    backup_status = _ai_error_status_code(backup_exc)
+                    if _is_non_retryable_ai_error(backup_exc):
+                        logger.error(
+                            "  备用 AI 也因配置/权限错误不可用（HTTP %s，模型=%s）。"
+                            "请分别检查主/备用 API key、base URL、模型和账户权限。",
+                            backup_status if backup_status is not None else "?",
+                            BAK_DEFAULT_MODEL or DEFAULT_MODEL,
+                        )
+                        raise
+                    else:
+                        logger.warning(
+                            "  备用 AI 请求失败：%s",
+                            _redact_ai_error(backup_exc),
+                        )
+                    return best_result
+            else:
+                # 将配置/权限错误交给产品流水线处理，避免外层关键词兜底再次请求同一个失效 key。
+                raise
+
         if not raw:
             logger.warning(f"  第 {attempt} 次生成返回空值，直接跳过本次尝试。")
             continue
@@ -1200,7 +1396,7 @@ async def generate_with_score_retry(
             if not isinstance(item, dict):
                 continue
             post_data = _build_score_post_data(item)
-            score = calculate_rank_math_score_locally(post_data)
+            score = calculate_seo_score_locally(post_data)
             item["_seo_score"] = score          # 顺手挂在 item 上，供后续代码参考
             batch_min = min(batch_min, score)
 
@@ -1212,8 +1408,8 @@ async def generate_with_score_retry(
                 )
                 # 收集具体失分维度，供下一轮改稿
                 title  = post_data["title"].lower()
-                kw     = post_data["meta"]["rank_math_focus_keyword"].lower().split(",")[0].strip()
-                desc   = post_data["meta"]["rank_math_description"].lower()
+                kw     = post_data["meta"]["focus_keyword"].lower().split(",")[0].strip()
+                desc   = post_data["meta"]["seo_description"].lower()
                 body   = re.sub(r"<[^>]+>", " ", post_data["content"]).lower()
                 issues = []
                 if kw and kw not in title:
@@ -1505,7 +1701,7 @@ def _sync_wc_product_media_schema(product_id: int, thumbnail_id: str, gallery_id
     return False
 
 
-def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id: str = "", gallery_ids: str = "", main_image_url: str = ""):
+def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id: str = "", gallery_ids: str = "", main_image_url: str = "", product_title: str = ""):
     """2. 将 AI 生成的一条组装数据作为全新产品发布到 WordPress"""
     try:
         # 获取字段，兼容多种可能的 key 命名
@@ -1513,6 +1709,7 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
         content = ai_data.get("productDescription", "")
         keyword = ai_data.get("keyword", "")
         title = ai_data.get("seoTitle", "")
+        wp_title = product_title or title
         description = ai_data.get("seoDescription", "")
         schema = _extract_schema_field(ai_data)
 
@@ -1531,7 +1728,7 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
         # 步骤 2.1: 创建核心字段（固定链接/正文内容） -> HTTP POST
         wp_create_url = f"{WP_URL}/product"
         wp_payload = {
-            "title": title,
+            "title": wp_title,
             "slug": slug,
             "content": content,
             "status": "publish",  # 直接发布
@@ -1547,16 +1744,6 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
             meta_payload["_product_image_gallery"] = str(gallery_ids)
         if "saswp_custom_schema_field" in writable_meta_keys and schema_str:
             meta_payload["saswp_custom_schema_field"] = schema_str
-        if "rank_math_seo_score" in writable_meta_keys:
-            meta_payload["rank_math_seo_score"] = calculate_rank_math_score_locally({
-                "title": title,
-                "content": content,
-                "link": slug,
-                "meta": {
-                    "rank_math_focus_keyword": keyword,
-                    "rank_math_description": description
-                }
-            })
         if meta_payload:
             wp_payload["meta"] = meta_payload
 
@@ -1570,7 +1757,7 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
         new_product_id = None
         for attempt in range(5):
             try:
-                logger.info(f"  -> 正在向 WordPress 提交并发布新产品 [{title}...] (尝试 {attempt+1}/5)...")
+                logger.info(f"  -> 正在向 WordPress 提交并发布新产品 [{wp_title}...] (尝试 {attempt+1}/5)...")
                 res_wp = requests.post(
                     wp_create_url,
                     json=wp_payload,
@@ -1630,41 +1817,18 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
                         if attempt < 4:
                             time.sleep(2)
 
-        # 步骤 2.3: 使用刚获取的新 ID 更新 RankMath 专属元数据
-        for attempt in range(5):
-            try:
-                logger.info(f"  -> 新产品已创建，分配ID:[{new_product_id}]! 即将为其刷入 RankMath 标签 (尝试 {attempt+1}/5)...")
-                rm_payload = {
-                    "objectID": new_product_id,
-                    "objectType": "post", # 对应 RankMath 的类型对象
-                    "meta": {
-                        "rank_math_focus_keyword": keyword,
-                        "rank_math_title": title,
-                        "rank_math_description": description
-                    }
-                }
-
-                res_rm = requests.post(
-                    WP_RM_URL,
-                    json=rm_payload,
-                    auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-                    timeout=20
-                )
-                res_rm.raise_for_status()
-
-                logger.info(f"✅ 产品 [{new_product_id}] 所有项已成功发布并同步了 SEO 数据！")
-                return new_product_id
-            except requests.exceptions.HTTPError as http_err:
-                err_text = http_err.response.text if hasattr(http_err, 'response') and hasattr(http_err.response, 'text') else ''
-                logger.warning(f"❌ HTTP 更新 RankMath 失败 (尝试 {attempt+1}/5): {http_err} {err_text}")
-                if attempt < 4:
-                    time.sleep(2)
-            except Exception as e:
-                logger.warning(f"❌ 更新 RankMath 遇到未知异常 (尝试 {attempt+1}/5): {e}")
-                if attempt < 4:
-                    time.sleep(2)
-
-        logger.error(f"❌ 产品 [{new_product_id}] 基础信息创建成功，但这 5 次尝试更新 RankMath 均失败。")
+        # 步骤 2.3: 使用刚获取的新 ID 更新 Yoast SEO 元数据
+        yoast_ok = sync_yoast_seo(
+            new_product_id,
+            "post",
+            keyword,
+            title,
+            description,
+        )
+        if yoast_ok:
+            logger.info(f"✅ 产品 [{new_product_id}] 所有项已成功发布并同步了 Yoast SEO 数据！")
+        else:
+            logger.error(f"❌ 产品 [{new_product_id}] 基础信息创建成功，但 Yoast SEO 元数据写入失败。")
         return new_product_id
 
     except Exception as e:
@@ -1689,12 +1853,21 @@ async def main():
         return
 
     client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
+    logger.info(
+        "✅ 主模型已就绪：%s（地址：%s）",
+        DEFAULT_MODEL,
+        str(AI_BASE_URL).rstrip("/"),
+    )
 
     # 备用模型客户端
     bak_client = None
     if BAK_AI_API_KEY and BAK_AI_BASE_URL and BAK_DEFAULT_MODEL:
         bak_client = AsyncOpenAI(api_key=BAK_AI_API_KEY, base_url=BAK_AI_BASE_URL)
-        logger.info(f"✅ 备用模型已就绪：{BAK_DEFAULT_MODEL}")
+        logger.info(
+            "✅ 备用模型已就绪：%s（地址：%s）",
+            BAK_DEFAULT_MODEL,
+            str(BAK_AI_BASE_URL).rstrip("/"),
+        )
     else:
         logger.info("ℹ️  未配置备用模型，最后一次重试继续使用主模型。")
 
@@ -1771,24 +1944,10 @@ async def main():
         keyword = _extract_id_and_name(prod_name)[1].strip()  # 剥离可能的 [ID] 前缀
         logger.info(f"\n⚡ 产品目录: [{keyword}] | 分类 ID: {cat_id}")
 
-        # 收集图片
-        image_files, existing_images = [], []
-        for file_name in os.listdir(prod_path):
-            if not file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                continue
-            if file_name.startswith('['):
-                try:
-                    img_id = file_name.split(']')[0].lstrip('[')
-                    if img_id.isdigit():
-                        existing_images.append((img_id, ""))
-                except Exception:
-                    pass
-            else:
-                image_files.append(os.path.join(prod_path, file_name))
-
-        image_files.sort()
-        existing_images.sort()
+        # 收集图片；普通方括号文件名也必须保留，只有 [数字ID] 才是已上传标记。
+        image_files, existing_images = _collect_product_images(prod_path)
         uploaded_images = list(existing_images)
+        failed_image_paths: list[str] = []
 
         if image_files:
             logger.info(f"📸 找到 {len(image_files)} 张图片，开始上传...")
@@ -1802,8 +1961,21 @@ async def main():
                         logger.info(f"    🌟 图片已标记: {new_name}")
                     except Exception as e:
                         logger.error(f"图片重命名失败: {e}")
+                else:
+                    failed_image_paths.append(img_path)
+                    logger.error(
+                        f"❌ 图片 {_display_path(img_path)} 未获得有效媒体 ID，"
+                        "本次不会将其视为上传成功。"
+                    )
         elif existing_images:
             logger.info(f"📸 发现 {len(existing_images)} 张已标记历史图片，直接复用。")
+
+        if failed_image_paths:
+            logger.error(
+                f"❌ 产品 [{keyword}] 有 {len(failed_image_paths)} 张图片上传失败，"
+                "已跳过产品发布并保留原目录；下次运行将继续重试。"
+            )
+            return
 
         thumbnail_id = ""
         gallery_ids = ""
@@ -1852,6 +2024,7 @@ async def main():
 
                 ai_data_list = await generate_with_score_retry(
                     client, [seed], main_image_url,
+                    custom_prompt=SEO_SYSTEM_PROMPT,
                     min_score=SEO_MIN_SCORE, max_retries=SEO_MAX_RETRIES,
                     bak_client=bak_client,
                 )
@@ -1873,7 +2046,7 @@ async def main():
                 logger.info(f"✨ 发布产品 ({kw[:30]}...) 分类 ID={cat_id}")
                 wp_id = await asyncio.to_thread(
                     publish_product_to_wordpress, item, cat_id,
-                    thumbnail_id, gallery_ids, main_image_url
+                    thumbnail_id, gallery_ids, main_image_url, prod_name
                 )
                 if wp_id:
                     success_count += 1

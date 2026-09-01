@@ -45,6 +45,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _normalize_wp_domain(domain: str) -> str:
+    return str(domain or "").strip().rstrip("/")
+
+
 # 读取配置文件
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
@@ -59,7 +64,7 @@ if not os.path.exists(config_path):
 config.read(config_path, encoding='utf-8')
 
 try:
-    WP_DOMAIN = config.get('WordPress', 'WP_DOMAIN')
+    WP_DOMAIN = _normalize_wp_domain(config.get('WordPress', 'WP_DOMAIN'))
     WP_URL = WP_DOMAIN + "/wp-json/wp/v2"
     WP_USERNAME = config.get('WordPress', 'WP_USERNAME')
     WP_PASSWORD = config.get('WordPress', 'WP_PASSWORD')

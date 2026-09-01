@@ -26,7 +26,14 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +42,8 @@ BUILD_DIR = ROOT / "build"
 
 WORKER_SCRIPT = ROOT / "wp4ai_generate.py"
 GUI_SCRIPT = ROOT / "wp4ai_gui.py"
+YOAST_PLUGIN_DIR = ROOT / "wordpress-plugin" / "wp4ai-yoast-rest-meta"
+RELEASE_ZIP = ROOT / "dist.zip"
 
 COMMON_EXCLUDES = [
     "--exclude-module", "torch",
@@ -231,6 +240,46 @@ def ensure_inputs_exist() -> None:
         raise FileNotFoundError("缺少必要文件:\n- " + "\n- ".join(missing))
 
 
+def build_release_archives(
+    dist_dir: Path,
+    plugin_dir: Path,
+    release_zip: Path,
+    readme_path: Path | None = None,
+) -> None:
+    """Create allowlisted release archives without local site credentials."""
+    if not plugin_dir.is_dir():
+        raise FileNotFoundError(f"缺少 Yoast WordPress 插件目录: {plugin_dir}")
+
+    plugin_zip = dist_dir / "wp4ai-yoast-rest-meta.zip"
+    with zipfile.ZipFile(plugin_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for file_path in sorted(plugin_dir.rglob("*")):
+            if file_path.is_file():
+                relative_path = file_path.relative_to(plugin_dir)
+                archive.write(
+                    file_path,
+                    arcname=(Path(plugin_dir.name) / relative_path).as_posix(),
+                )
+
+    executable_paths = [
+        dist_dir / "wp4ai_gui.exe",
+        dist_dir / "wp4ai_generate_cli.exe",
+    ]
+    available_executables = [path for path in executable_paths if path.is_file()]
+    if not available_executables:
+        raise FileNotFoundError(f"发布目录中没有可打包的 EXE: {dist_dir}")
+
+    release_files = [*available_executables, plugin_zip]
+    if readme_path is not None and readme_path.is_file():
+        release_files.append(readme_path)
+
+    with zipfile.ZipFile(release_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for file_path in release_files:
+            archive.write(file_path, arcname=file_path.name)
+
+    log(f"==> WordPress 插件包: {plugin_zip}")
+    log(f"==> 安全发布包（不含 wp4ai_sites.db/config.ini）: {release_zip}")
+
+
 def build_cli_cmd(python_exe: str) -> list[str]:
     return [
         python_exe, "-m", "PyInstaller",
@@ -387,6 +436,13 @@ def main() -> int:
         run_step("构建 wp4ai_generate_cli.exe", build_cli_cmd(py), timeout=step_timeout)
     if args.only in ("all", "gui"):
         run_step("构建 wp4ai_gui.exe", build_gui_cmd(py), timeout=step_timeout)
+
+    build_release_archives(
+        dist_dir=DIST_DIR,
+        plugin_dir=YOAST_PLUGIN_DIR,
+        release_zip=RELEASE_ZIP,
+        readme_path=ROOT / "README.md",
+    )
 
     log(f"\n✅ 打包完成！输出目录: {DIST_DIR}")
     if (DIST_DIR / "wp4ai_gui.exe").exists():

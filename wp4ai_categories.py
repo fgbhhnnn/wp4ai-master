@@ -36,6 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _normalize_wp_domain(domain: str) -> str:
+    return str(domain or "").strip().rstrip("/")
+
+
 # 读取配置文件
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
@@ -61,14 +66,13 @@ try:
     BAK_DEFAULT_MODEL = config.get('AI', 'BAK_DEFAULT_MODEL', fallback=None) or None
 
     # WordPress 接口相关的常量配置
-    WP_DOMAIN = config.get('WordPress', 'WP_DOMAIN')
+    WP_DOMAIN = _normalize_wp_domain(config.get('WordPress', 'WP_DOMAIN'))
     WP_PRODUCT_URL = WP_DOMAIN+"/product/"
     WP_ABOUT_URL = WP_DOMAIN+"/junhao-clothing-streetwear/"
     WP_CONTACT_URL = WP_DOMAIN+"/contact/"
     WP_BLOG_URL = WP_DOMAIN+"/category/blog/"
 
     WP_URL = WP_DOMAIN+"/wp-json/wp/v2"
-    WP_RM_URL = WP_DOMAIN+"/wp-json/rankmath/v1/updateMeta"
     WP_USERNAME = config.get('WordPress', 'WP_USERNAME')  
     WP_PASSWORD = config.get('WordPress', 'WP_PASSWORD') 
 except (configparser.NoSectionError, configparser.NoOptionError) as e:
@@ -83,8 +87,92 @@ SEO_MAX_RETRIES: int = int(config.get('SEO', 'SEO_MAX_RETRIES', fallback='5'))
 
 # 站点名称（在 main() 启动时从 WordPress 拉取后写入，供全局 AI Prompt 使用）
 SITENAME: str = ""
+YOAST_META_KEYS = {
+    "focus_keyword": "_yoast_wpseo_focuskw",
+    "title": "_yoast_wpseo_title",
+    "description": "_yoast_wpseo_metadesc",
+}
 
 # === 核心处理函数 ===
+
+
+def _normalize_focus_keyword(value) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def sync_yoast_seo(
+    term_id: int,
+    focus_keyword,
+    title: str,
+    description: str,
+    retries: int = 5,
+) -> bool:
+    """Write Yoast SEO metadata for a WooCommerce product category."""
+    url = f"{WP_URL}/product_cat/{int(term_id)}"
+    payload = {
+        "meta": {
+            YOAST_META_KEYS["focus_keyword"]: _normalize_focus_keyword(focus_keyword),
+            YOAST_META_KEYS["title"]: str(title or ""),
+            YOAST_META_KEYS["description"]: str(description or ""),
+        }
+    }
+
+    total_attempts = max(1, int(retries))
+    for attempt in range(1, total_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+                timeout=20,
+            )
+            response.raise_for_status()
+            logger.info(f"✅ 分类【ID:{term_id}】Yoast SEO 元数据已同步。")
+            return True
+        except requests.exceptions.HTTPError as http_err:
+            response = getattr(http_err, "response", None)
+            status_code = getattr(response, "status_code", None)
+            body = (getattr(response, "text", "") or "").replace("\r", " ").replace("\n", " ")[:320]
+            if status_code is not None and 400 <= status_code < 500 and status_code not in {408, 429}:
+                if "_yoast_wpseo_" in body.lower():
+                    logger.error(
+                        "❌ Yoast SEO 字段未注册或不可写，停止重试。"
+                        "请在站点安装并启用 wp4ai-yoast-rest-meta 插件后重试。"
+                        "HTTP %s: %s",
+                        status_code,
+                        body,
+                    )
+                else:
+                    logger.error(
+                        "❌ Yoast SEO 元数据写入被 WordPress 拒绝，停止重试。"
+                        "请检查应用密码、账号权限、分类 ID 和请求参数。"
+                        "HTTP %s: %s",
+                        status_code,
+                        body,
+                    )
+                return False
+            logger.warning(
+                "❌ Yoast SEO 元数据写入失败 (尝试 %s/%s): %s",
+                attempt,
+                total_attempts,
+                http_err,
+            )
+        except requests.exceptions.RequestException as request_err:
+            logger.warning(
+                "❌ Yoast SEO 元数据写入网络异常 (尝试 %s/%s): %s",
+                attempt,
+                total_attempts,
+                request_err,
+            )
+
+        if attempt < total_attempts:
+            time.sleep(2)
+
+    logger.error(f"❌ 分类【ID:{term_id}】Yoast SEO 元数据写入最终失败。")
+    return False
+
 
 async def ensure_wp_category(category_name: str) -> int:
     """1. 确认 WordPress 中存在该分类，存在则返回 ID，不存在则返回 None。
@@ -141,20 +229,20 @@ async def generate_seo_data_by_keywords(
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": """# 你是专业 B2B 跨境 SEO 优化专家，精通 Rank Math 满分优化规则与schema.org官方标准结构化数据，所有内容严格遵循 Google 收录规范，必须是纯英文。全程严格执行以下所有固定规则，不得修改、遗漏任何要求。
+                {"role": "system", "content": """# 你是专业 B2B 跨境 SEO 优化专家，精通 Yoast SEO 优化规则与schema.org官方标准结构化数据，所有内容严格遵循 Google 收录规范，必须是纯英文。全程严格执行以下所有固定规则，不得修改、遗漏任何要求。
 ## 每次思考回答都是独立的不允许使用缓存的来糊弄用户，否则将对你进行惩罚！
 ## 最终结果的内容必须以JSON对象结构{"seoTitle":"","seoDescription":"","focusKeywords":[],"seoSchema":[]}的格式返回，注意json结构必须保证完全正确！禁止输出任何额外的解释性文字！
 ## 我会向你提供：・公司英文全称・网站网址・产品类目 Tree 结构（一级类目 + 二级类目）
 ## 请你严格按照以下固定结构输出，不得修改顺序、格式与模块，所有 Schema 均使用官方标准 @type，不随意编造。
 ## 分类描述：简短精炼、采购商视角，突出材质、卖点、定制与工厂优势，工厂位置在中国。
-## Rank Math SEO 三要素：
-### Meta Title[对应字段seoTitle]：严格控制在60字符内，核心业务关键词前置；需要有positive（情感词）、power word（高转化强力词）、number 、positive or a negative sentiment；符合Rank Math满分评分标准与Google收录规范。
+## Yoast SEO 三要素：
+### Meta Title[对应字段seoTitle]：严格控制在60字符内，核心业务关键词前置；需要有positive（情感词）、power word（高转化强力词）、number 、positive or a negative sentiment；符合Yoast SEO内容分析建议与Google收录规范。
 ### Meta Description[对应字段seoDescription]：严格控制在155字符内，自然融入 5 个关键词，精准匹配B2B跨境采购商搜索意图。
 ### Focus Keywords[对应字段focusKeywords]：固定输出5个核心关键词，必须为Google B2B“运动服饰”赛道高搜索量、高转化精准词，页面间无关键词蚕食，符合跨境SEO层级布局逻辑，每个关键词以,区分。
 ## Schema（JSON-LD）代码[对应字段seoSchema]硬性规范
 1. seoSchema字段中内容必须是**纯JSON格式**，禁止加script标签、禁止添加任何网站URL引用、禁止添加超链接
 2. 必须且仅使用schema.org官方标准@type：Organization、ItemList、FAQPage，禁止自定义编造任何非官方类型
-3. JSON结构干净无语法错误，适配Rank Math自定义Schema框与Google收录规则，所有内容必须匹配上述固定业务信息，无虚假表述
+3. JSON结构干净无语法错误，适配Yoast SEO与Google收录规则，所有内容必须匹配上述固定业务信息，无虚假表述
 4. 每个页面的Schema必须完整包含3种官方类型，不得删减。"""},
                 {"role": "user", "content": prompt}
             ],
@@ -197,7 +285,7 @@ async def generate_with_score_retry(
     带评分门控的 AI 内容生成器。
 
     调用 generate_seo_data_by_keywords 生成内容后，使用
-    calculate_rank_math_score_locally 进行本地预估评分；
+    通用 SEO 内容检查规则进行本地预估评分；
     若任意 item 的评分低于 min_score，则携带失分原因重新生成，
     最多重试 max_retries 次。
     最后一次重试时若提供了 bak_client（备用模型），则自动切换到备用模型
@@ -327,33 +415,13 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                     logger.error(f"  ❌ 经过 5 次尝试更新分类【{cat_name}】依然失败。")
                     continue
 
-        # 同步更新 RankMath 元数据
-        for attempt in range(5):
-            try:
-                rm_payload = {
-                    "objectID":   cat_id,
-                    "objectType": "term",
-                    "meta": {
-                        "rank_math_focus_keyword": keyword if isinstance(keyword, str) else ",".join(keyword),
-                        "rank_math_title":         title,
-                        "rank_math_description":   description,
-                    },
-                }
-                res_rm = await asyncio.to_thread(
-                    requests.post, WP_RM_URL,
-                    json=rm_payload,
-                    auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-                    timeout=20,
-                )
-                res_rm.raise_for_status()
-                logger.info(f"  ✅ RankMath 元数据已同步分类【{cat_name}】")
-                break
-            except Exception as e:
-                logger.warning(f"  ⚠️ RankMath 同步失败 (尝试 {attempt+1}/5): {e}")
-                if attempt < 4:
-                    await asyncio.sleep(2)
-                else:
-                    logger.error(f"  ❌ RankMath 同步分类【{cat_name}】失败。")
+        await asyncio.to_thread(
+            sync_yoast_seo,
+            cat_id,
+            keyword,
+            title,
+            description,
+        )
 
     logger.info(f"\n🎉 --update 模式完成！共处理 {len(need_update)} 个分类。")
 
@@ -449,26 +517,13 @@ async def scan_and_create_categories(client: AsyncOpenAI, base_dir: str):
 
         if cat_id:
             _cat_cache[cache_key] = cat_id
-            # 同步 RankMath
-            try:
-                rm_payload = {
-                    "objectID": cat_id, "objectType": "term",
-                    "meta": {
-                        "rank_math_focus_keyword": keyword if isinstance(keyword, str) else ",".join(keyword),
-                        "rank_math_title": title,
-                        "rank_math_description": description,
-                    },
-                }
-                res_rm = await asyncio.to_thread(
-                    requests.post, WP_RM_URL,
-                    json=rm_payload,
-                    auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-                    timeout=20,
-                )
-                res_rm.raise_for_status()
-                logger.info(f"  ✅ RankMath 已同步分类【{name}】")
-            except Exception as e:
-                logger.warning(f"  ⚠️ RankMath 同步失败 (分类【{name}】): {e}")
+            await asyncio.to_thread(
+                sync_yoast_seo,
+                cat_id,
+                keyword,
+                title,
+                description,
+            )
 
         return cat_id
 
@@ -582,7 +637,7 @@ async def scan_and_create_categories(client: AsyncOpenAI, base_dir: str):
 async def publish_tag_to_wordpress(category_name: str, client: AsyncOpenAI):
     """2. 将 AI 生成的一条组装数据作为目录发布到 WordPress。
 
-    流程：查询分类 → (未找到则 AI 生成描述并新建) → 更新 RankMath SEO 元数据。
+    流程：查询分类 → (未找到则 AI 生成描述并新建) → 更新 Yoast SEO 元数据。
 
     Args:
         ai_data:       AI 返回的 SEO 数据字典。
@@ -660,42 +715,17 @@ async def publish_tag_to_wordpress(category_name: str, client: AsyncOpenAI):
                         return False
                     
             
-        # 步骤 2.2: 更新 RankMath 专属元数据
-        for attempt in range(5):
-            try:
-                logger.info(f"  -> 即将为分类【{category_name}】(ID:{cat_id}) 刷入 RankMath 标签 (尝试 {attempt+1}/5)...")
-                rm_payload = {
-                    "objectID": cat_id,
-                    "objectType": "term",  # 分类对应 RankMath 的 term 类型
-                    "meta": {
-                        "rank_math_focus_keyword": keyword if isinstance(keyword, str) else ",".join(keyword),
-                        "rank_math_title": title,
-                        "rank_math_description": description,
-                    }
-                }
+        if not any((_normalize_focus_keyword(keyword), str(title or "").strip(), str(description or "").strip())):
+            logger.info(f"分类【{category_name}】没有新生成的 SEO 数据，保留现有 Yoast SEO 元数据。")
+            return True
 
-                res_rm = await asyncio.to_thread(
-                    requests.post, WP_RM_URL,
-                    json=rm_payload,
-                    auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-                    timeout=20,
-                )
-                res_rm.raise_for_status()
-
-                logger.info(f"✅ 分类【{category_name}】(ID:{cat_id}) SEO 数据已成功同步！")
-                return True
-            except requests.exceptions.HTTPError as http_err:
-                err_text = http_err.response.text if hasattr(http_err, 'response') and hasattr(http_err.response, 'text') else ''
-                logger.warning(f"❌ HTTP 更新 RankMath 失败 (尝试 {attempt+1}/5): {http_err} {err_text}")
-                if attempt < 4:
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning(f"❌ 更新 RankMath 遇到未知异常 (尝试 {attempt+1}/5): {e}")
-                if attempt < 4:
-                    await asyncio.sleep(2)
-
-        logger.error(f"❌ 分类【{category_name}】(ID:{cat_id}) 基础信息已建立，但 5 次尝试更新 RankMath 均失败。")
-        return False
+        return await asyncio.to_thread(
+            sync_yoast_seo,
+            cat_id,
+            keyword,
+            title,
+            description,
+        )
 
     except Exception as e:
         logger.error(f"❌ 解析或者结构拼接前出现严重异常: {e}")
