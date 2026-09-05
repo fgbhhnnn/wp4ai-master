@@ -1,4 +1,5 @@
 import os
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -190,9 +191,30 @@ class UploadMediaDiagnosticsTest(unittest.TestCase):
             "image/jpeg",
         )
 
+    def test_wc_media_sync_rejects_response_that_drops_images(self):
+        response = FakeResponse(payload={"images": [], "meta_data": []})
+
+        with patch.object(wp4ai_generate.requests, "put", return_value=response):
+            with patch.object(wp4ai_generate.time, "sleep"):
+                result = wp4ai_generate._sync_wc_product_media_schema(
+                    987,
+                    thumbnail_id="123",
+                    gallery_ids="456",
+                    schema_str="",
+                )
+
+        self.assertFalse(result)
+
 
 class SeoPromptCustomizationTest(unittest.IsolatedAsyncioTestCase):
-    async def test_default_prompt_targets_yoast_seo(self):
+    def setUp(self):
+        self._original_prompt = wp4ai_generate.SEO_SYSTEM_PROMPT
+        wp4ai_generate.SEO_SYSTEM_PROMPT = "Test product SEO instructions."
+
+    def tearDown(self):
+        wp4ai_generate.SEO_SYSTEM_PROMPT = self._original_prompt
+
+    async def test_empty_prompt_does_not_call_ai(self):
         create = AsyncMock(
             return_value=SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content='{"data": []}'))]
@@ -202,15 +224,14 @@ class SeoPromptCustomizationTest(unittest.IsolatedAsyncioTestCase):
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
 
-        await wp4ai_generate.generate_seo_data_by_keywords(
-            client,
-            ["leather handbag"],
-        )
+        with patch.object(wp4ai_generate, "SEO_SYSTEM_PROMPT", ""):
+            result = await wp4ai_generate.generate_seo_data_by_keywords(
+                client,
+                ["leather handbag"],
+            )
 
-        system_prompt = create.await_args.kwargs["messages"][0]["content"]
-        self.assertIn("Yoast SEO", system_prompt)
-        self.assertNotIn("Rank Math", system_prompt)
-        self.assertNotIn("RankMath", system_prompt)
+        self.assertIsNone(result)
+        create.assert_not_awaited()
 
     async def test_custom_prompt_replaces_only_system_message(self):
         create = AsyncMock(
@@ -336,6 +357,7 @@ class GuiSeoPromptConfigTest(unittest.TestCase):
     def test_site_prompt_is_written_to_worker_config(self):
         site = wp4ai_gui.SiteConfig.new_default()
         site.seo_system_prompt = "Line one\nLine two with 100% precision"
+        site.seo_category_prompt = "Category instructions with 100% precision"
         app = object.__new__(wp4ai_gui.WP4AIGui)
 
         temp_path = app.write_temp_config(site)
@@ -346,9 +368,197 @@ class GuiSeoPromptConfigTest(unittest.TestCase):
                 worker_config.get("SEO", "SEO_SYSTEM_PROMPT"),
                 site.seo_system_prompt,
             )
+            self.assertEqual(
+                worker_config.get("SEO", "SEO_CATEGORY_SYSTEM_PROMPT"),
+                site.seo_category_prompt,
+            )
         finally:
             os.unlink(temp_path)
 
+    def test_validate_site_rejects_empty_category_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site = wp4ai_gui.SiteConfig.new_default()
+            site.products_dir = tmpdir
+            site.wp_username = "wp-user"
+            site.wp_password = "wp-pass"
+            site.ai_api_key = "test-key"
+            site.seo_system_prompt = "Product instructions"
+            site.seo_category_prompt = ""
+            app = object.__new__(wp4ai_gui.WP4AIGui)
+
+            ok, errors = app.validate_site(site)
+
+        self.assertFalse(ok)
+        self.assertIn("SEO分类提示词为空", errors)
+
+    def test_category_prompt_round_trips_through_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = object.__new__(wp4ai_gui.WP4AIGui)
+            app.db_path = os.path.join(tmpdir, "sites.db")
+            site = wp4ai_gui.SiteConfig.new_default()
+            site.name = "Category prompt site"
+            site.seo_system_prompt = "Product instructions"
+            site.seo_category_prompt = "Category instructions"
+            app.sites = [site]
+            app.init_database()
+            app._save_sites()
+
+            conn = app._db_connect()
+            try:
+                row = conn.execute(
+                    "SELECT seo_system_prompt, seo_category_prompt FROM sites WHERE site_id = ?",
+                    (site.site_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(row["seo_system_prompt"], "Product instructions")
+        self.assertEqual(row["seo_category_prompt"], "Category instructions")
+
+
+class YoastWorkerPromptCustomizationTest(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "wp4ai_generate_yoast_test", Path(ROOT, "wp4ai_generate-yoast.py")
+        )
+        cls.worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.worker)
+
+    async def test_custom_prompt_is_used_as_system_message(self):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content='{"data": []}'),
+                )]
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = await self.worker.generate_seo_data_by_keywords(
+            client,
+            ["leather handbag"],
+            custom_prompt="Use only my instructions.",
+        )
+
+        self.assertEqual(result, '{"data": []}')
+        messages = create.await_args.kwargs["messages"]
+        self.assertEqual(messages[0], {"role": "system", "content": "Use only my instructions."})
+        self.assertIn("leather handbag", messages[1]["content"])
+
+    async def test_empty_prompt_skips_ai_request(self):
+        create = AsyncMock()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with patch.object(self.worker, "SEO_SYSTEM_PROMPT", ""):
+            result = await self.worker.generate_seo_data_by_keywords(
+                client,
+                ["leather handbag"],
+            )
+
+        self.assertIsNone(result)
+        create.assert_not_awaited()
+
+    async def test_custom_category_prompt_is_used_as_system_message(self):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content='{"description": "Category copy"}'),
+                )]
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = await self.worker._generate_cat_seo(
+            client,
+            "Wholesale Bags",
+            custom_prompt="Use only my category instructions.",
+        )
+
+        self.assertEqual(result, {"description": "Category copy"})
+        messages = create.await_args.kwargs["messages"]
+        self.assertEqual(
+            messages[0],
+            {"role": "system", "content": "Use only my category instructions."},
+        )
+        self.assertIn("Wholesale Bags", messages[1]["content"])
+
+    async def test_empty_category_prompt_skips_ai_request(self):
+        create = AsyncMock()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with patch.object(self.worker, "SEO_CATEGORY_SYSTEM_PROMPT", ""):
+            result = await self.worker._generate_cat_seo(client, "Wholesale Bags")
+
+        self.assertEqual(result, {})
+        create.assert_not_awaited()
+
+    def test_product_and_category_prompt_defaults_are_not_embedded_in_worker_source(self):
+        for worker_name in ("wp4ai_generate-yoast.py", "wp4ai_generate.py"):
+            with self.subTest(worker=worker_name):
+                source = Path(ROOT, worker_name).read_text(encoding="utf-8")
+
+                self.assertNotIn("你是专业 B2B 跨境 SEO 文案专家", source)
+                self.assertNotIn("你是专业 B2B 跨境 SEO 优化专家", source)
+
+    def test_standalone_error_redacts_json_credentials(self):
+        raw = '{"password":"wp-secret","api_key":"sk-live-secret","authorization":"Bearer token"}'
+        redacted = self.worker._redact_error_text(raw)
+
+        self.assertNotIn("wp-secret", redacted)
+        self.assertNotIn("sk-live-secret", redacted)
+        self.assertNotIn("Bearer token", redacted)
+        self.assertIn("[REDACTED]", redacted)
+        self.assertIn("[REDACTED_API_KEY]", redacted)
+
+
+class MainWorkerCategoryPromptCustomizationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_category_prompt_is_used_as_system_message(self):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content='{"seoTitle": "Category title"}'),
+                )]
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = await wp4ai_generate._generate_cat_seo(
+            client,
+            "Wholesale Bags",
+            custom_prompt="Use only my category instructions.",
+        )
+
+        self.assertEqual(result, {"seoTitle": "Category title"})
+        messages = create.await_args.kwargs["messages"]
+        self.assertEqual(
+            messages[0],
+            {"role": "system", "content": "Use only my category instructions."},
+        )
+        self.assertIn("Wholesale Bags", messages[1]["content"])
+
+    async def test_empty_category_prompt_skips_ai_request(self):
+        create = AsyncMock()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with patch.object(wp4ai_generate, "SEO_CATEGORY_SYSTEM_PROMPT", ""):
+            result = await wp4ai_generate._generate_cat_seo(client, "Wholesale Bags")
+
+        self.assertEqual(result, {})
+        create.assert_not_awaited()
 
 class GuiAiConnectionTest(unittest.TestCase):
     def test_ai_connection_redacts_api_key_from_error_body(self):
@@ -400,6 +610,21 @@ class GuiAiConnectionTest(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertTrue(any("备用AI" in error for error in errors))
+
+    def test_validate_site_rejects_empty_seo_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site = wp4ai_gui.SiteConfig.new_default()
+            site.products_dir = tmpdir
+            site.wp_username = "wp-user"
+            site.wp_password = "wp-pass"
+            site.ai_api_key = "test-key"
+            site.seo_system_prompt = ""
+            app = object.__new__(wp4ai_gui.WP4AIGui)
+
+            ok, errors = app.validate_site(site)
+
+        self.assertFalse(ok)
+        self.assertIn("SEO产品提示词为空", errors)
 
 
 class WordPressDomainNormalizationTest(unittest.TestCase):
@@ -457,6 +682,16 @@ class CategoryCreationFallbackTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ProductImageDiscoveryTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._original_prompt = wp4ai_generate.SEO_SYSTEM_PROMPT
+        self._original_category_prompt = wp4ai_generate.SEO_CATEGORY_SYSTEM_PROMPT
+        wp4ai_generate.SEO_SYSTEM_PROMPT = "Test product SEO instructions."
+        wp4ai_generate.SEO_CATEGORY_SYSTEM_PROMPT = "Test category SEO instructions."
+
+    def tearDown(self):
+        wp4ai_generate.SEO_SYSTEM_PROMPT = self._original_prompt
+        wp4ai_generate.SEO_CATEGORY_SYSTEM_PROMPT = self._original_category_prompt
+
     def test_bracketed_filename_without_numeric_media_id_is_not_dropped(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = os.path.join(tmpdir, "[front].webp")
@@ -491,21 +726,39 @@ class ProductImageDiscoveryTest(unittest.IsolatedAsyncioTestCase):
                                 "scan_and_build_cat_cache",
                                 new=AsyncMock(),
                             ):
-                                with patch.object(
-                                    wp4ai_generate,
-                                    "generate_with_score_retry",
-                                    new=AsyncMock(return_value=[]),
-                                ):
+                                with patch.object(wp4ai_generate, "preflight_wordpress", return_value=True):
                                     with patch.object(
                                         wp4ai_generate,
-                                        "upload_wp_media",
-                                        return_value=(789, "https://example.com/product.webp"),
-                                    ) as upload:
-                                        await wp4ai_generate.main()
+                                        "generate_with_score_retry",
+                                        new=AsyncMock(return_value=[]),
+                                    ):
+                                        with patch.object(
+                                            wp4ai_generate,
+                                            "upload_wp_media",
+                                            return_value=(789, "https://example.com/product.webp"),
+                                        ) as upload:
+                                            await wp4ai_generate.main()
 
         upload.assert_called_once()
         uploaded_path = upload.call_args.args[0]
         self.assertEqual(uploaded_path.removeprefix("\\\\?\\"), image_path)
+
+    async def test_preflight_failure_stops_before_scan_and_upload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"WP4AI_PRODUCTS_DIR": tmpdir}, clear=False):
+                with patch.object(wp4ai_generate, "AI_API_KEY", "test-key"):
+                    with patch.object(wp4ai_generate, "SEO_SYSTEM_PROMPT", "Test prompt"):
+                        with patch.object(wp4ai_generate, "preflight_wordpress", return_value=False):
+                            with patch.object(
+                                wp4ai_generate,
+                                "scan_and_build_cat_cache",
+                                new=AsyncMock(),
+                            ) as scan:
+                                with patch.object(wp4ai_generate, "upload_wp_media") as upload:
+                                    await wp4ai_generate.main()
+
+        scan.assert_not_awaited()
+        upload.assert_not_called()
 
     async def test_product_pipeline_does_not_mark_directory_when_image_upload_fails(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -529,22 +782,23 @@ class ProductImageDiscoveryTest(unittest.IsolatedAsyncioTestCase):
                                 "scan_and_build_cat_cache",
                                 new=AsyncMock(),
                             ):
-                                with patch.object(
-                                    wp4ai_generate,
-                                    "generate_with_score_retry",
-                                    new=AsyncMock(return_value=generated),
-                                ):
+                                with patch.object(wp4ai_generate, "preflight_wordpress", return_value=True):
                                     with patch.object(
                                         wp4ai_generate,
-                                        "upload_wp_media",
-                                        return_value=(None, None),
-                                    ) as upload:
+                                        "generate_with_score_retry",
+                                        new=AsyncMock(return_value=generated),
+                                    ):
                                         with patch.object(
                                             wp4ai_generate,
-                                            "publish_product_to_wordpress",
-                                            return_value=987,
-                                        ) as publish:
-                                            await wp4ai_generate.main()
+                                            "upload_wp_media",
+                                            return_value=(None, None),
+                                        ) as upload:
+                                            with patch.object(
+                                                wp4ai_generate,
+                                                "publish_product_to_wordpress",
+                                                return_value=987,
+                                            ) as publish:
+                                                await wp4ai_generate.main()
 
             upload.assert_called_once()
             publish.assert_not_called()
@@ -558,6 +812,158 @@ class ProductImageDiscoveryTest(unittest.IsolatedAsyncioTestCase):
 
 
 class YoastSeoSyncTest(unittest.TestCase):
+    def setUp(self):
+        wp4ai_generate.YOAST_INTEGRATION_MODE = None
+        wp4ai_generate.POST_TYPE_CAPABILITY_CACHE.clear()
+
+    def tearDown(self):
+        wp4ai_generate.YOAST_INTEGRATION_MODE = None
+        wp4ai_generate.POST_TYPE_CAPABILITY_CACHE.clear()
+
+    def test_detects_bulk_editor_route(self):
+        response = FakeResponse(
+            payload={
+                "routes": {
+                    "/wp/v2/product": {},
+                    "/wp/v2/product_cat": {},
+                    "/yoast/v1/bulk_editor/update_search": {},
+                    "/yoast/v1/get_head": {},
+                }
+            }
+        )
+
+        with patch.object(wp4ai_generate.requests, "get", return_value=response):
+            mode = wp4ai_generate.detect_yoast_integration(force=True)
+
+        self.assertEqual(mode, "bulk")
+
+    def test_bulk_mode_only_requires_write_route(self):
+        response = FakeResponse(
+            payload={
+                "routes": {
+                    "/wp/v2/product": {},
+                    "/wp/v2/product_cat": {},
+                    "/yoast/v1/bulk_editor/update_search": {},
+                }
+            }
+        )
+        options_payload = {"methods": ["GET", "POST"], "endpoints": [{"methods": ["POST"], "args": {}}]}
+
+        with patch.object(wp4ai_generate.requests, "get", return_value=response):
+            with patch.object(
+                wp4ai_generate.requests,
+                "options",
+                side_effect=[FakeResponse(payload=options_payload), FakeResponse(payload=options_payload)],
+            ):
+                mode = wp4ai_generate.detect_yoast_integration(force=True)
+
+        self.assertEqual(mode, "bulk")
+
+    def test_detects_meta_plugin_from_product_and_category_options(self):
+        root = FakeResponse(payload={"routes": {"/wp/v2/product": {}, "/wp/v2/product_cat": {}}})
+        options_payload = {
+            "methods": ["GET", "POST"],
+            "endpoints": [
+                {
+                    "methods": ["POST"],
+                    "args": {
+                        "meta": {
+                            "properties": {
+                                "_yoast_wpseo_focuskw": {},
+                                "_yoast_wpseo_title": {},
+                                "_yoast_wpseo_metadesc": {},
+                            }
+                        }
+                    },
+                }
+            ],
+        }
+
+        with patch.object(wp4ai_generate.requests, "get", return_value=root):
+            with patch.object(
+                wp4ai_generate.requests,
+                "options",
+                side_effect=[FakeResponse(payload=options_payload), FakeResponse(payload=options_payload)],
+            ) as options:
+                mode = wp4ai_generate.detect_yoast_integration(force=True)
+
+        self.assertEqual(mode, "meta")
+        self.assertEqual(options.call_count, 2)
+
+    def test_detects_none_when_neither_bulk_route_nor_meta_plugin_exists(self):
+        root = FakeResponse(payload={"routes": {"/wp/v2/product": {}, "/wp/v2/product_cat": {}}})
+        options_payload = {"methods": ["GET", "POST"], "endpoints": [{"methods": ["POST"], "args": {}}]}
+
+        with patch.object(wp4ai_generate.requests, "get", return_value=root):
+            with patch.object(
+                wp4ai_generate.requests,
+                "options",
+                side_effect=[FakeResponse(payload=options_payload), FakeResponse(payload=options_payload)],
+            ):
+                with self.assertLogs(wp4ai_generate.logger, level="ERROR") as logs:
+                    mode = wp4ai_generate.detect_yoast_integration(force=True)
+
+        self.assertEqual(mode, "none")
+        self.assertIn("请安装并启用 wp4ai-yoast-rest-meta 辅助插件", "\n".join(logs.output))
+
+    def test_bulk_mode_uses_yoast_bulk_editor_endpoint(self):
+        response = FakeResponse(payload={"success": True})
+        wp4ai_generate.YOAST_INTEGRATION_MODE = "bulk"
+
+        with patch.object(wp4ai_generate.requests, "post", return_value=response) as post:
+            result = wp4ai_generate.sync_yoast_seo(
+                987,
+                "post",
+                "focus keyword",
+                "SEO Title",
+                "SEO description",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(post.call_args.args[0], wp4ai_generate.WP_YOAST_BULK_URL)
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            {
+                "items": [{
+                    "id": 987,
+                    "seo_title": "SEO Title",
+                    "meta_description": "SEO description",
+                    "focus_keyphrase": "focus keyword",
+                }]
+            },
+        )
+
+    def test_bulk_mode_rejects_failed_response_payload(self):
+        wp4ai_generate.YOAST_INTEGRATION_MODE = "bulk"
+        with patch.object(
+            wp4ai_generate.requests,
+            "post",
+            return_value=FakeResponse(payload={"results": [{"success": False}]}),
+        ):
+            result = wp4ai_generate.sync_yoast_seo(
+                987, "post", "focus keyword", "SEO Title", "SEO description", retries=1
+            )
+
+        self.assertFalse(result)
+
+    def test_bulk_mode_requires_success_for_requested_object(self):
+        wp4ai_generate.YOAST_INTEGRATION_MODE = "bulk"
+        response = FakeResponse(
+            payload={
+                "results": [
+                    {"id": 123, "success": True},
+                    {"id": 987, "success": False},
+                ]
+            }
+        )
+
+        with patch.object(wp4ai_generate.requests, "post", return_value=response):
+            result = wp4ai_generate.sync_yoast_seo(
+                987, "post", "focus keyword", "SEO Title", "SEO description", retries=1
+            )
+
+        self.assertFalse(result)
+
     def test_sync_yoast_product_uses_standard_rest_meta(self):
         response = FakeResponse(payload={"id": 987})
 
@@ -631,6 +1037,28 @@ class YoastSeoSyncTest(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
         self.assertIn("wp4ai-yoast-rest-meta", "\n".join(logs.output))
+
+    def test_bulk_mode_term_accepts_standard_rest_response(self):
+        """Bulk mode uses standard REST for terms, so validate its object response normally."""
+        wp4ai_generate.YOAST_INTEGRATION_MODE = "bulk"
+        response = FakeResponse(payload={"id": 42, "taxonomy": "product_cat"})
+
+        with patch.object(
+            wp4ai_generate,
+            "_get_post_type_capability",
+            return_value={"writable_meta_keys": set(wp4ai_generate.YOAST_REQUIRED_META_KEYS)},
+        ):
+            with patch.object(wp4ai_generate.requests, "post", return_value=response) as post:
+                result = wp4ai_generate.sync_yoast_seo(
+                    42,
+                    "term",
+                    ["wholesale bags"],
+                    "Wholesale Bags",
+                    "Wholesale bags from a custom manufacturer.",
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(post.call_args.args[0], f"{wp4ai_generate.WP_URL}/product_cat/42")
 
     def test_sync_yoast_auth_error_does_not_claim_plugin_is_missing(self):
         response = FakeResponse(
@@ -856,6 +1284,8 @@ class PublishProductTitleTest(unittest.TestCase):
             posts.append((url, json))
             if url.endswith("/product"):
                 return FakeResponse(payload={"id": 987})
+            if url.endswith("/product/987") and json == {"status": "publish"}:
+                return FakeResponse(payload={"id": 987, "status": "publish"})
             return FakeResponse(payload={"ok": True})
 
         ai_data = {
@@ -877,7 +1307,8 @@ class PublishProductTitleTest(unittest.TestCase):
 
         self.assertEqual(result, 987)
         self.assertEqual(posts[0][1]["title"], "Directory Product Name")
-        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1]["status"], "draft")
+        self.assertEqual(len(posts), 2)
         sync.assert_called_once_with(
             987,
             "post",
@@ -885,6 +1316,31 @@ class PublishProductTitleTest(unittest.TestCase):
             "SEO Title",
             "SEO description",
         )
+
+    def test_publish_product_keeps_draft_when_yoast_sync_fails(self):
+        posts = []
+
+        def fake_post(url, json=None, **kwargs):
+            posts.append((url, json))
+            return FakeResponse(payload={"id": 987})
+
+        ai_data = {
+            "Url": "sample-product",
+            "productDescription": "<p>Body</p>",
+            "keyword": "focus keyword",
+            "seoTitle": "SEO Title",
+            "seoDescription": "SEO description",
+        }
+
+        with patch.object(wp4ai_generate, "_get_post_type_capability", return_value={}):
+            with patch.object(wp4ai_generate, "_sync_wc_product_media_schema", return_value=True):
+                with patch.object(wp4ai_generate, "sync_yoast_seo", return_value=False):
+                    with patch.object(wp4ai_generate.requests, "post", side_effect=fake_post):
+                        result = wp4ai_generate.publish_product_to_wordpress(ai_data)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1]["status"], "draft")
 
 
 if __name__ == "__main__":

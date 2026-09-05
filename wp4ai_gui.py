@@ -20,6 +20,16 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Close GUI database connections when a transaction context exits."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 APP_TITLE = "WP4AI 多站点发布控制台"
 SITE_DB_FILENAME = "wp4ai_sites.db"
 LEGACY_SITE_JSON_FILENAME = "wp4ai_sites.json"
@@ -55,10 +65,16 @@ def _looks_like_sgcaptcha(payload: str) -> bool:
 def _redact_ai_error_text(value: object, limit: int = 220) -> str:
     """脱敏连接测试错误，防止代理回显完整 API key。"""
     text = str(value or "").replace("\r", " ").replace("\n", " ")
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)\b(?:bearer\s+)?[A-Za-z0-9._-]*sk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)\bsk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
     text = re.sub(
-        r"(?i)(api[ _-]?key\s*[:=]\s*)[^\s,;]+",
-        r"\1[REDACTED_API_KEY]",
+        r"(?i)([\"']?authorization[\"']?\s*[:=]\s*)([\"']?)bearer\s+[^\"'\s,;}]+(\2)",
+        r"\1\2[REDACTED]\3",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([\"']?(?:authorization|api[ _-]?key|password|secret|token)[\"']?\s*[:=]\s*)([\"']?)(?!\[REDACTED_API_KEY\])([^\"'\s,;}]+)(\2)",
+        r"\1\2[REDACTED]\4",
         text,
     )
     return text[:limit]
@@ -124,6 +140,7 @@ class SiteConfig:
     seo_min_score: str
     seo_max_retries: str
     seo_system_prompt: str
+    seo_category_prompt: str
     mode: str
 
     @staticmethod
@@ -145,6 +162,7 @@ class SiteConfig:
             seo_min_score="65",
             seo_max_retries="5",
             seo_system_prompt="",
+            seo_category_prompt="",
             mode="full",
         )
 
@@ -407,7 +425,11 @@ class WP4AIGui:
         )
 
     def _db_connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=10,
+            factory=_ClosingSQLiteConnection,
+        )
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -432,6 +454,7 @@ class WP4AIGui:
                     seo_min_score TEXT NOT NULL DEFAULT '65',
                     seo_max_retries TEXT NOT NULL DEFAULT '5',
                     seo_system_prompt TEXT NOT NULL DEFAULT '',
+                    seo_category_prompt TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'full',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -449,6 +472,10 @@ class WP4AIGui:
             if "seo_system_prompt" not in site_columns:
                 conn.execute(
                     "ALTER TABLE sites ADD COLUMN seo_system_prompt TEXT NOT NULL DEFAULT ''"
+                )
+            if "seo_category_prompt" not in site_columns:
+                conn.execute(
+                    "ALTER TABLE sites ADD COLUMN seo_category_prompt TEXT NOT NULL DEFAULT ''"
                 )
 
     def _db_get_setting(self, key: str, default_value: str) -> str:
@@ -618,7 +645,7 @@ class WP4AIGui:
         self._grid_entry(fields, row, "SEO重试次数（SEO_MAX_RETRIES）", self.var_seo_max_retries)
         row += 1
 
-        ttk.Label(fields, text="自定义SEO系统提示词（留空使用默认）").grid(
+        ttk.Label(fields, text="产品SEO提示词（必须填写，传给产品生成函数）").grid(
             row=row, column=0, sticky="nw", padx=8, pady=6
         )
         prompt_frame = ttk.Frame(fields)
@@ -632,6 +659,25 @@ class WP4AIGui:
         )
         prompt_scroll.grid(row=0, column=1, sticky="ns")
         self.seo_prompt_text.configure(yscrollcommand=prompt_scroll.set)
+        fields.grid_rowconfigure(row, weight=1)
+        row += 1
+
+        ttk.Label(fields, text="分类SEO提示词（必须填写，传给分类生成函数）").grid(
+            row=row, column=0, sticky="nw", padx=8, pady=6
+        )
+        category_prompt_frame = ttk.Frame(fields)
+        category_prompt_frame.grid(row=row, column=1, sticky="nsew", padx=8, pady=6)
+        category_prompt_frame.grid_columnconfigure(0, weight=1)
+        category_prompt_frame.grid_rowconfigure(0, weight=1)
+        self.seo_category_prompt_text = tk.Text(category_prompt_frame, height=8, wrap="word")
+        self.seo_category_prompt_text.grid(row=0, column=0, sticky="nsew")
+        category_prompt_scroll = ttk.Scrollbar(
+            category_prompt_frame,
+            orient=tk.VERTICAL,
+            command=self.seo_category_prompt_text.yview,
+        )
+        category_prompt_scroll.grid(row=0, column=1, sticky="ns")
+        self.seo_category_prompt_text.configure(yscrollcommand=category_prompt_scroll.set)
         fields.grid_rowconfigure(row, weight=1)
         row += 1
 
@@ -742,9 +788,9 @@ class WP4AIGui:
                         wp_domain, wp_username, wp_password,
                         ai_api_key, ai_base_url, default_model,
                         bak_ai_api_key, bak_ai_base_url, bak_default_model,
-                        seo_min_score, seo_max_retries, seo_system_prompt, mode,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        seo_min_score, seo_max_retries, seo_system_prompt,
+                        seo_category_prompt, mode, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(site_id) DO UPDATE SET
                         sort_order = excluded.sort_order,
                         enabled = excluded.enabled,
@@ -762,6 +808,7 @@ class WP4AIGui:
                         seo_min_score = excluded.seo_min_score,
                         seo_max_retries = excluded.seo_max_retries,
                         seo_system_prompt = excluded.seo_system_prompt,
+                        seo_category_prompt = excluded.seo_category_prompt,
                         mode = excluded.mode,
                         updated_at = excluded.updated_at
                 """, (
@@ -770,7 +817,7 @@ class WP4AIGui:
                     site.ai_api_key, site.ai_base_url, site.default_model,
                     site.bak_ai_api_key, site.bak_ai_base_url, site.bak_default_model,
                     site.seo_min_score, site.seo_max_retries, site.seo_system_prompt,
-                    site.mode, created_at, now
+                    site.seo_category_prompt, site.mode, created_at, now
                 ))
 
             if keep_ids:
@@ -834,6 +881,8 @@ class WP4AIGui:
         self.var_seo_max_retries.set(site.seo_max_retries)
         self.seo_prompt_text.delete("1.0", tk.END)
         self.seo_prompt_text.insert("1.0", site.seo_system_prompt)
+        self.seo_category_prompt_text.delete("1.0", tk.END)
+        self.seo_category_prompt_text.insert("1.0", site.seo_category_prompt)
         self.var_mode.set(site.mode)
         self.mode_combo.set(MODE_MAP.get(site.mode, MODE_MAP["full"]))
 
@@ -853,6 +902,7 @@ class WP4AIGui:
         site.seo_min_score = self.var_seo_min_score.get().strip() or "65"
         site.seo_max_retries = self.var_seo_max_retries.get().strip() or "5"
         site.seo_system_prompt = self.seo_prompt_text.get("1.0", "end-1c").strip()
+        site.seo_category_prompt = self.seo_category_prompt_text.get("1.0", "end-1c").strip()
         mode_raw = self.var_mode.get().strip().lower()
         site.mode = mode_raw if mode_raw in MODE_MAP else "full"
 
@@ -876,6 +926,10 @@ class WP4AIGui:
             errs.append("主AI地址为空")
         if not site.default_model.strip():
             errs.append("主AI模型为空")
+        if not site.seo_system_prompt.strip():
+            errs.append("SEO产品提示词为空")
+        if not site.seo_category_prompt.strip():
+            errs.append("SEO分类提示词为空")
 
         try:
             int(site.seo_min_score.strip())
@@ -918,6 +972,7 @@ class WP4AIGui:
             "SEO_MIN_SCORE": site.seo_min_score,
             "SEO_MAX_RETRIES": site.seo_max_retries,
             "SEO_SYSTEM_PROMPT": site.seo_system_prompt,
+            "SEO_CATEGORY_SYSTEM_PROMPT": site.seo_category_prompt,
         }
 
         fd, temp_path = tempfile.mkstemp(prefix="wp4ai_cfg_", suffix=".ini")
@@ -1046,10 +1101,13 @@ class WP4AIGui:
                 timeout=CONNECTION_TEST_TIMEOUT,
             )
             if resp.status_code >= 400:
-                return False, f"WordPress 连接失败，HTTP {resp.status_code}: {resp.text[:180]}"
+                return False, (
+                    f"WordPress 连接失败，HTTP {resp.status_code}: "
+                    f"{_redact_ai_error_text(resp.text)}"
+                )
 
             content_type = str(resp.headers.get("Content-Type", ""))
-            body_head = (resp.text or "")[:180].replace("\n", " ").replace("\r", " ")
+            body_head = _redact_ai_error_text(resp.text)
             if _looks_like_sgcaptcha(resp.text):
                 return False, (
                     "WordPress API 被 SiteGround SGCaptcha/Anti-Bot 拦截。"
@@ -1064,13 +1122,13 @@ class WP4AIGui:
             except Exception as e:
                 return False, (
                     f"WordPress 返回非 JSON 响应，HTTP {resp.status_code}, "
-                    f"Content-Type={content_type}, Body={body_head}, 异常={e}"
+                    f"Content-Type={content_type}, Body={body_head}, 异常={_redact_ai_error_text(e)}"
                 )
 
             title_text = title if title else "未返回站点标题"
             return True, f"WordPress 连接成功，站点标题: {title_text}"
         except Exception as e:
-            return False, f"WordPress 连接异常: {e}"
+            return False, f"WordPress 连接异常: {_redact_ai_error_text(e)}"
 
     def _test_ai_connection(
         self,

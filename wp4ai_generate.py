@@ -68,10 +68,16 @@ def _ai_error_status_code(exc: Exception) -> int | None:
 def _redact_ai_error(exc: Exception, limit: int = 320) -> str:
     """生成不包含完整 API key 的错误摘要，避免密钥意外进入日志。"""
     text = str(exc or "").replace("\r", " ").replace("\n", " ")
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)\b(?:bearer\s+)?[A-Za-z0-9._-]*sk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)\bsk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
     text = re.sub(
-        r"(?i)(api[ _-]?key\s*[:=]\s*)[^\s,;]+",
-        r"\1[REDACTED_API_KEY]",
+        r"(?i)([\"']?authorization[\"']?\s*[:=]\s*)([\"']?)bearer\s+[^\"'\s,;}]+(\2)",
+        r"\1\2[REDACTED]\3",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([\"']?(?:authorization|api[ _-]?key|password|secret|token)[\"']?\s*[:=]\s*)([\"']?)(?!\[REDACTED_API_KEY\])([^\"'\s,;}]+)(\2)",
+        r"\1\2[REDACTED]\4",
         text,
     )
     return text[:limit]
@@ -107,7 +113,7 @@ def _looks_like_sgcaptcha(payload: str) -> bool:
 
 
 def _response_brief(resp: requests.Response, limit: int = 220) -> str:
-    body = (resp.text or "").replace("\r", " ").replace("\n", " ")
+    body = _redact_ai_error(resp.text or "", limit=limit)
     if len(body) > limit:
         body = body[:limit] + "..."
     return body
@@ -356,15 +362,22 @@ except (configparser.NoSectionError, configparser.NoOptionError) as e:
 SEO_MIN_SCORE: int = int(config.get('SEO', 'SEO_MIN_SCORE', fallback='65'))
 SEO_MAX_RETRIES: int = int(config.get('SEO', 'SEO_MAX_RETRIES', fallback='5'))
 SEO_SYSTEM_PROMPT: str = config.get('SEO', 'SEO_SYSTEM_PROMPT', fallback='')
+SEO_CATEGORY_SYSTEM_PROMPT: str = config.get('SEO', 'SEO_CATEGORY_SYSTEM_PROMPT', fallback='')
 
 # 站点名称（main() 启动时从 WP 拉取，供分类 AI Prompt 使用）
 SITENAME: str = ""
 POST_TYPE_CAPABILITY_CACHE: dict[str, dict] = {}
+YOAST_INTEGRATION_MODE: str | None = None
 YOAST_META_KEYS = {
     "focus_keyword": "_yoast_wpseo_focuskw",
     "title": "_yoast_wpseo_title",
     "description": "_yoast_wpseo_metadesc",
 }
+WP_YOAST_BULK_URL = WP_DOMAIN + "/wp-json/yoast/v1/bulk_editor/update_search"
+WP_YOAST_HEAD_URL = WP_DOMAIN + "/wp-json/yoast/v1/get_head"
+YOAST_BULK_ROUTE = "/yoast/v1/bulk_editor/update_search"
+YOAST_HEAD_ROUTE = "/yoast/v1/get_head"
+YOAST_REQUIRED_META_KEYS = frozenset(YOAST_META_KEYS.values())
 
 # === 核心处理函数 ===
 
@@ -390,6 +403,121 @@ def _is_yoast_meta_registration_error(resp: requests.Response | None) -> bool:
     return "_yoast_wpseo_" in _response_brief(resp, limit=500).lower()
 
 
+def _route_is_available(routes: dict, route: str) -> bool:
+    """Match exact REST routes and routes carrying a dynamic suffix."""
+    target = str(route).rstrip("/")
+    for candidate in routes or {}:
+        normalized = str(candidate).rstrip("/")
+        if normalized == target or normalized.startswith(target + "/"):
+            return True
+    return False
+
+
+def detect_yoast_integration(force: bool = False) -> str:
+    """Detect the site's supported Yoast write path.
+
+    Returns ``bulk`` for Yoast Premium's REST editor, ``meta`` for the
+    companion plugin's writable REST meta fields, or ``none`` when neither
+    path is available.  Detection is cached for the process and can be
+    refreshed with ``force=True`` at the beginning of a new run.
+    """
+    global YOAST_INTEGRATION_MODE
+    if YOAST_INTEGRATION_MODE is not None and not force:
+        return YOAST_INTEGRATION_MODE
+
+    YOAST_INTEGRATION_MODE = "none"
+    try:
+        root_resp = requests.get(
+            f"{WP_DOMAIN}/wp-json/",
+            auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+            timeout=20,
+        )
+        root_resp.raise_for_status()
+        root = _json_object_or_raise(root_resp, "检测 WordPress REST 路由")
+        routes = root.get("routes") if isinstance(root, dict) else {}
+        routes = routes if isinstance(routes, dict) else {}
+
+        if not _route_is_available(routes, "/wp/v2/product"):
+            logger.error("❌ 当前站点未发现 WooCommerce product REST 路由。")
+        elif not _route_is_available(routes, "/wp/v2/product_cat"):
+            logger.error("❌ 当前站点未发现 WooCommerce product_cat REST 路由。")
+        elif _route_is_available(routes, YOAST_BULK_ROUTE):
+            YOAST_INTEGRATION_MODE = "bulk"
+            logger.info("✅ 检测到 Yoast yoast/v1 REST 路由，将使用 Yoast Bulk Editor 写入。")
+            return YOAST_INTEGRATION_MODE
+        else:
+            product_cap = _get_post_type_capability("product")
+            category_cap = _get_post_type_capability("product_cat")
+            product_keys = product_cap.get("writable_meta_keys", set()) or set()
+            category_keys = category_cap.get("writable_meta_keys", set()) or set()
+            if YOAST_REQUIRED_META_KEYS.issubset(product_keys) and YOAST_REQUIRED_META_KEYS.issubset(category_keys):
+                YOAST_INTEGRATION_MODE = "meta"
+                logger.info("✅ 检测到 wp4ai-yoast-rest-meta 可写字段，将使用标准 REST meta 写入。")
+                return YOAST_INTEGRATION_MODE
+    except Exception as exc:
+        logger.error("❌ Yoast 集成检测失败: %s", _redact_ai_error(exc))
+
+    logger.error(
+        "❌ 当前站点未检测到可用的 Yoast SEO 写入方式。"
+        "请安装并启用 wp4ai-yoast-rest-meta 辅助插件，"
+        "或安装/启用提供 yoast/v1 REST 路由的 Yoast SEO Premium。"
+        "本次未创建产品。"
+    )
+    return YOAST_INTEGRATION_MODE
+
+
+def preflight_wordpress() -> bool:
+    """Validate Yoast support before any scan, upload, or write operation."""
+    mode = detect_yoast_integration(force=True)
+    if mode == "none":
+        logger.error("WordPress/Yoast 预检未通过，未创建分类、上传图片或创建产品。")
+        return False
+    try:
+        user_resp = requests.get(
+            f"{WP_URL}/users/me",
+            params={"context": "edit"},
+            auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+            timeout=20,
+        )
+        user_resp.raise_for_status()
+        user = _json_object_or_raise(user_resp, "验证 WordPress 账号")
+        if not user.get("id"):
+            raise RuntimeError("账号身份响应缺少用户 ID")
+        capabilities = user.get("capabilities")
+        if isinstance(capabilities, dict) and capabilities:
+            product_capability_names = {
+                "administrator", "manage_woocommerce", "publish_products",
+                "edit_products", "create_products",
+            }
+            term_capability_names = {
+                "administrator", "manage_woocommerce", "manage_product_terms",
+                "edit_product_terms", "assign_product_terms",
+            }
+            known_names = product_capability_names | term_capability_names
+            if any(name in capabilities for name in known_names):
+                if not any(capabilities.get(name) for name in product_capability_names):
+                    raise RuntimeError("当前账号没有创建/发布 WooCommerce 产品的权限")
+                if not any(capabilities.get(name) for name in term_capability_names):
+                    raise RuntimeError("当前账号没有创建/编辑产品分类的权限")
+        if mode == "bulk":
+            permission_probe = requests.post(
+                WP_YOAST_BULK_URL,
+                json={"items": []},
+                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+                timeout=20,
+            )
+            if not _yoast_bulk_permission_probe_ok(permission_probe):
+                raise RuntimeError(
+                    "Yoast Bulk Editor 权限探测失败: "
+                    f"{_response_diagnostic(permission_probe, limit=300)}"
+                )
+    except Exception as exc:
+        logger.error("❌ WordPress 账号权限预检失败: %s", _redact_ai_error(exc))
+        return False
+    logger.info("WordPress/Yoast 预检通过（写入模式: %s）。", mode)
+    return True
+
+
 def sync_yoast_seo(
     object_id: int,
     object_type: str,
@@ -398,20 +526,46 @@ def sync_yoast_seo(
     description: str,
     retries: int = 5,
 ) -> bool:
-    """Write Yoast SEO post or product-category metadata through WP REST."""
+    """Write Yoast SEO metadata through the detected compatible REST path."""
     endpoint_by_type = {"post": "product", "term": "product_cat"}
     if object_type not in endpoint_by_type:
         raise ValueError(f"不支持的 Yoast SEO 对象类型: {object_type}")
 
-    endpoint = endpoint_by_type[object_type]
-    url = f"{WP_URL}/{endpoint}/{int(object_id)}"
-    payload = {
-        "meta": {
-            YOAST_META_KEYS["focus_keyword"]: _normalize_focus_keyword(focus_keyword),
-            YOAST_META_KEYS["title"]: str(title or ""),
-            YOAST_META_KEYS["description"]: str(description or ""),
+    mode = YOAST_INTEGRATION_MODE or "meta"
+    if mode == "none":
+        logger.error("❌ Yoast SEO 写入不可用，跳过对象 ID=%s。", object_id)
+        return False
+    focus_value = _normalize_focus_keyword(focus_keyword)
+    if mode == "bulk" and object_type == "post":
+        url = WP_YOAST_BULK_URL
+        payload = {
+            "items": [{
+                "id": int(object_id),
+                "seo_title": str(title or ""),
+                "meta_description": str(description or ""),
+                "focus_keyphrase": focus_value,
+            }]
         }
-    }
+    else:
+        if mode == "bulk" and object_type == "term":
+            category_cap = _get_post_type_capability("product_cat")
+            category_keys = category_cap.get("writable_meta_keys", set()) or set()
+            if not YOAST_REQUIRED_META_KEYS.issubset(category_keys):
+                logger.warning(
+                    "⚠️ Yoast Bulk Editor 未提供分类写入接口，且 product_cat 未暴露 Yoast meta；"
+                    "分类 ID=%s 未同步 Yoast SEO。",
+                    object_id,
+                )
+                return False
+        endpoint = endpoint_by_type[object_type]
+        url = f"{WP_URL}/{endpoint}/{int(object_id)}"
+        payload = {
+            "meta": {
+                YOAST_META_KEYS["focus_keyword"]: focus_value,
+                YOAST_META_KEYS["title"]: str(title or ""),
+                YOAST_META_KEYS["description"]: str(description or ""),
+            }
+        }
 
     total_attempts = max(1, int(retries))
     for attempt in range(1, total_attempts + 1):
@@ -423,6 +577,15 @@ def sync_yoast_seo(
                 timeout=20,
             )
             resp.raise_for_status()
+            # 产品使用 Yoast Bulk Editor；分类在 bulk 模式下仍使用 product_cat
+            # 标准 REST 接口，其响应是分类对象而不是 Bulk Editor 结果结构。
+            if mode == "bulk" and object_type == "post":
+                bulk_payload = _json_object_or_raise(resp, "写入 Yoast Bulk Editor")
+                success = _yoast_bulk_result_success(bulk_payload, object_id)
+                if not success:
+                    raise UnexpectedWPResponseError(
+                        f"Yoast Bulk Editor 返回失败: {_response_brief(resp, limit=320)}"
+                    )
             logger.info(
                 "✅ Yoast SEO 元数据已同步：%s ID=%s",
                 "产品" if object_type == "post" else "分类",
@@ -458,6 +621,12 @@ def sync_yoast_seo(
                 total_attempts,
                 request_err,
             )
+        except Exception as unexpected_err:
+            logger.error(
+                "❌ Yoast SEO 元数据响应异常，停止重试：%s",
+                _redact_ai_error(unexpected_err),
+            )
+            return False
 
         if attempt < total_attempts:
             time.sleep(2)
@@ -469,6 +638,55 @@ def sync_yoast_seo(
         object_id,
     )
     return False
+
+
+def _yoast_bulk_result_success(payload: dict, object_id: int) -> bool:
+    """确认 Bulk Editor 返回的是当前对象的成功结果，而不是其它项目的结果。"""
+    if not isinstance(payload, dict):
+        return False
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload.get("success") is True
+
+    target = str(object_id)
+    matching = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        identifiers = (
+            item.get("id"),
+            item.get("post_id"),
+            item.get("term_id"),
+            item.get("object_id"),
+        )
+        if any(value is not None and str(value) == target for value in identifiers):
+            matching.append(item)
+    return bool(matching) and any(item.get("success") is True for item in matching)
+
+
+def _yoast_bulk_permission_probe_ok(response: requests.Response) -> bool:
+    """判断空 Bulk 请求是否至少通过了认证/权限层。"""
+    status = getattr(response, "status_code", None)
+    if status == 200:
+        return True
+    if status is None or status in {401, 403} or status >= 500:
+        return False
+    if status not in {400, 422}:
+        return False
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return False
+    code = str(payload.get("code", "")).lower()
+    message = str(payload.get("message", "")).lower()
+    return (
+        "invalid" in code
+        or "param" in code
+        or "item" in message
+        or "required" in message
+    )
 
 
 def ensure_wp_category(category_name: str) -> int:
@@ -508,7 +726,10 @@ def ensure_wp_category(category_name: str) -> int:
                 logger.error(f"❌ 经过 5 次尝试获取/建分类依然失败。")
                 return None
         except Exception as e:
-            logger.warning(f"获取/创建分类【{category_name}】时网络异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"获取/创建分类【{category_name}】时网络异常 (尝试 {attempt+1}/5): "
+                f"{_redact_ai_error(e)}"
+            )
             if attempt < 4:
                 time.sleep(2)
             else:
@@ -530,28 +751,22 @@ def _extract_id_and_name(raw_name: str) -> tuple:
     return None, raw_name
 
 
-async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
-    """为分类名生成 SEO 元数据（seoTitle/seoDescription/focusKeywords/seoSchema）。"""
+async def _generate_cat_seo(
+    client: AsyncOpenAI,
+    cat_name: str,
+    custom_prompt: str = "",
+) -> dict:
+    """使用 GUI 提供的提示词生成分类 SEO 元数据。"""
     prompt = f"- 公司名称:{SITENAME}\n- 网站网址:{WP_DOMAIN}\n- 产品类目:{cat_name}"
+    system_prompt = str(custom_prompt or SEO_CATEGORY_SYSTEM_PROMPT or "").strip()
+    if not system_prompt:
+        logger.error("SEO 分类提示词为空，请在 GUI 页面填写后再运行。")
+        return {}
     try:
         resp = await client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": """# 你是专业 B2B 跨境 SEO 优化专家，精通 Yoast SEO 优化规则与schema.org官方标准结构化数据，所有内容严格遵循 Google 收录规范，必须是纯英文。全程严格执行以下所有固定规则，不得修改、遗漏任何要求。
-## 每次思考回答都是独立的不允许使用缓存的来糊弄用户，否则将对你进行惩罚！
-## 最终结果的内容必须以JSON对象结构{"seoTitle":"","seoDescription":"","focusKeywords":[],"seoSchema":[]}的格式返回，注意json结构必须保证完全正确！禁止输出任何额外的解释性文字！
-## 我会向你提供：・公司英文全称・网站网址・产品类目 Tree 结构（一级类目 + 二级类目）
-## 请你严格按照以下固定结构输出，不得修改顺序、格式与模块，所有 Schema 均使用官方标准 @type，不随意编造。
-## 分类描述：简短精炼、采购商视角，突出材质、卖点、定制与工厂优势，工厂位置在中国。
-## Yoast SEO 三要素：
-### Meta Title[对应字段seoTitle]：严格控制在60字符内，核心业务关键词前置；需要有positive（情感词）、power word（高转化强力词）、number 、positive or a negative sentiment；符合Yoast SEO内容分析建议与Google收录规范。
-### Meta Description[对应字段seoDescription]：严格控制在155字符内，自然融入 5 个关键词，精准匹配B2B跨境采购商搜索意图。
-### Focus Keywords[对应字段focusKeywords]：固定输出5个核心关键词，必须为Google B2B“运动服饰”赛道高搜索量、高转化精准词，页面间无关键词蚕食，符合跨境SEO层级布局逻辑，每个关键词以,区分。
-## Schema（JSON-LD）代码[对应字段seoSchema]硬性规范
-1. seoSchema字段中内容必须是**纯JSON格式**，禁止加script标签、禁止添加任何网站URL引用、禁止添加超链接
-2. 必须且仅使用schema.org官方标准@type：Organization、ItemList、FAQPage，禁止自定义编造任何非官方类型
-3. JSON结构干净无语法错误，适配Yoast SEO与Google收录规则，所有内容必须匹配上述固定业务信息，无虚假表述
-4. 每个页面的Schema必须完整包含3种官方类型，不得删减。"""},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7, max_tokens=4096,
@@ -561,7 +776,7 @@ async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception as e:
-        logger.warning(f"分类 [{cat_name}] SEO 生成失败: {e}")
+        logger.warning(f"分类 [{cat_name}] SEO 生成失败: {_redact_ai_error(e)}")
         return {}
 
 
@@ -598,7 +813,10 @@ async def _ensure_cat_with_parent(
                     return cat["id"]
             break
         except Exception as e:
-            logger.warning(f"  查询分类【{name}】异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"  查询分类【{name}】异常 (尝试 {attempt+1}/5): "
+                f"{_redact_ai_error(e)}"
+            )
             if _is_sgcaptcha_error(e):
                 logger.error("  ❌ 检测到站点启用了 SGCaptcha，分类查询接口被拦截。")
                 return None
@@ -609,7 +827,11 @@ async def _ensure_cat_with_parent(
 
     # 不存在 → AI 生成描述并新建
     logger.info(f"  -> 新建分类【{name}】(parent:{parent_id})...")
-    ai = await _generate_cat_seo(client, name)
+    ai = await _generate_cat_seo(
+        client,
+        name,
+        custom_prompt=SEO_CATEGORY_SYSTEM_PROMPT,
+    )
     description = ai.get("seoDescription", "")
     schema = ai.get("seoSchema", "")
     keyword = ai.get("focusKeywords", "")
@@ -654,7 +876,10 @@ async def _ensure_cat_with_parent(
                 logger.error(f"  ❌ 新建分类【{name}】失败。")
                 return None
         except Exception as e:
-            logger.warning(f"  新建分类【{name}】异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"  新建分类【{name}】异常 (尝试 {attempt+1}/5): "
+                f"{_redact_ai_error(e)}"
+            )
             if _is_sgcaptcha_error(e):
                 logger.error("  ❌ 检测到站点启用了 SGCaptcha，分类创建接口被拦截。")
                 return None
@@ -665,8 +890,7 @@ async def _ensure_cat_with_parent(
                 return None
 
     if cat_id:
-        cat_cache[cache_key] = cat_id
-        await asyncio.to_thread(
+        yoast_ok = await asyncio.to_thread(
             sync_yoast_seo,
             cat_id,
             "term",
@@ -674,6 +898,9 @@ async def _ensure_cat_with_parent(
             title,
             description,
         )
+        if not yoast_ok:
+            raise RuntimeError(f"分类【{name}】Yoast SEO 同步失败，停止后续产品处理")
+        cat_cache[cache_key] = cat_id
     return cat_id
 
 
@@ -774,7 +1001,7 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                 break
             page += 1
         except Exception as e:
-            logger.error(f"❌ 获取分类列表失败 (第 {page} 页): {e}")
+            logger.error(f"❌ 获取分类列表失败 (第 {page} 页): {_redact_ai_error(e)}")
             break
 
     need = [c for c in all_cats if not (c.get("description") or "").strip()]
@@ -783,7 +1010,11 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
     for cat in need:
         cat_id, cat_name = cat.get("id"), cat.get("name", "")
         logger.info(f"\n>>> 补全分类【{cat_name}】(ID:{cat_id})...")
-        ai = await _generate_cat_seo(client, cat_name)
+        ai = await _generate_cat_seo(
+            client,
+            cat_name,
+            custom_prompt=SEO_CATEGORY_SYSTEM_PROMPT,
+        )
         if not ai:
             continue
         description = ai.get("seoDescription", "")
@@ -805,7 +1036,9 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                 logger.info(f"  ✅ 描述已更新（{len(description)} 字符）")
                 break
             except Exception as e:
-                logger.warning(f"  PATCH 失败 (尝试 {attempt+1}/5): {e}")
+                logger.warning(
+                    f"  PATCH 失败 (尝试 {attempt+1}/5): {_redact_ai_error(e)}"
+                )
                 if attempt < 4:
                     await asyncio.sleep(2)
         await asyncio.to_thread(
@@ -853,7 +1086,10 @@ def upload_wp_media(file_path: str):
                 data = _json_object_or_raise(res, f"上传图片 {filename}")
                 return data.get("id"), data.get("source_url")
             except UnexpectedWPResponseError as e:
-                logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
+                logger.warning(
+                    f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): "
+                    f"{_redact_ai_error(e)}"
+                )
                 return None, None
             except requests.exceptions.HTTPError as e:
                 logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {_http_error_diagnostic(e)}")
@@ -890,7 +1126,10 @@ def upload_wp_media(file_path: str):
                     logger.error(f"❌ 图片 {filename} 经过 5 次尝试依然上传失败。")
                     return None, None
             except Exception as e:
-                logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
+                logger.warning(
+                    f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): "
+                    f"{_redact_ai_error(e)}"
+                )
                 if _is_sgcaptcha_error(e):
                     logger.error("❌ 检测到站点启用了 SGCaptcha 反爬/机器人验证，媒体上传接口被拦截。")
                     return None, None
@@ -939,37 +1178,10 @@ async def generate_seo_data_by_keywords(
 
     prompt = "、".join(keywords)
 
-    img_instruction = ""
-    if main_img_url:
-        logger.info(f"存在主图:{main_img_url}")
-        img_instruction = f"必须在产品详情的 HTML 中合适位置插入主图：<img src=\"{main_img_url}\" alt=\"焦点关键词\" />。"
-
-    default_system_prompt = f"""产品 SEO 优化专家指令 (Prompt)
-角色： 你是一位精通Google排名算法、Yoast SEO、内容EEAT、以及Schema结构化数据的资深seo专家，擅长通过高质量内容提升 Google 排名及用户转化率。
-任务:基于用户提供的【产品关键词】，生成一套符合SEO规范的纯英文产品内容。所有的输出必须是一个JSON格式的数组，每个数组元素对应一个关键词的设计。
-JSON返回包含字段：[Url,keyword,seoTitle,seoDescription,productDescription,Schema]，严格执行以下规则：
-1. 产品URL[Url]：必须由核心关键词生成，全小写，单词间用-连接，字符数≤25 个（不含域名）仅输出路径部分，不带任何前缀
-2. 长尾关键词（6 个）[keyword]：必须是Google上真实有搜索量的产品词，不使用过于冷门的词，以核心产品词为中心，扩展不同用户搜索意图（如材质、场景、人群），用英文逗号分隔，不换行，第1个词必须简洁，可直接用于生成 URL
-3. Meta Title[seoTitle]：以产品核心关键词开头，必须包含数字（如年份2026、功能点数量），字符数控制在50-60之间，句式简洁，包含卖点，标题中必须包含核心关键词!
-4. Meta Description[seoDescription]：核心关键词开头，字符数控制在150-160之间，自然通顺带有点击意图，描述中必须包含核心关键词
-5. 产品详情 HTML（核心要求）[productDescription]：完整可直接复制的 HTML 代码模板，内容必须纯英文！不能丢失任何标签结构必须符合：
-①全程以B2B采购商视角创作，深度贴合定制大货买家核心决策关注点，全文纯英文输出；所有内容严格基于产品标题与所属品类属性撰写，不虚构规格、不捏造参数、不杜撰无效数据，贴合 GEO+SEO 优化逻辑，严格按四大模块结构化罗列撰写：
-Product Core Parameters：采用表格形式呈现，仅提取标题原生关键词，结合对应品类基础属性做专业维度补充，无虚假尺寸、无编造数值；
-Core Product Features：围绕该品类专属材质特性、核心生产工艺、结构设计逻辑、使用性能、功能细节展开专业描述，贴合行业内行术语，不通用套话；
-Application & Wholesale Advantage:聚焦和中国工厂定制大货合作，适配初创品牌、自有品牌品牌贴牌、项目定向定制等合作模式，支持品牌资料保密、专属方案独立开发，承接长期稳定复购大货订单；
-Customized Service：依照不同品类做精准定制延伸，举例：服饰类补充面料肌理、弹力材质、亲肤织造、吸湿排汗材质选型；工业机械类强化材质用料、结构配置、配件规格、工艺标准；全品类可覆盖外观配色、标识印刷、结构调整、配套方案定制开发。
-②必须符合：
-1 个<h2>作为主标题、至少 2 个<h3>作为二级标题、至少 2 个<h4>作为三级标题、每段内容必须用<p>标签包裹；
-将6个长尾关键词按顺序用<strong>标签加粗植入内容中，字数要求：600-700 词，段落简短高可读性，并且从以下链接中，选择3个作为内链:首页{WP_DOMAIN}、产品列表{WP_PRODUCT_URL}、关于我们{WP_ABOUT_URL}、联系我们{WP_CONTACT_URL}、博客{WP_BLOG_URL}。{img_instruction}
-6. Schema（JSON-LD）[Schema]：必须包含Product + FAQPage + Organization三部分
-    - name：产品全称
-    - description：与 Meta Description 一致
-    - url：完整产品页面链接（可使用 {WP_PRODUCT_URL} + Url 字段）
-    - image：产品图片链接（可使用 https://example.com/image.jpg 占位）
-    - mainEntity：FAQ 部分至少包含 3 个用户常见问题与回答，附加 1 个 HowTo JSON-LD
-
-核心要求：请你记住，无论content是否有其他逗号要求，他都是一个产品，不能输出多个产品，所有内容必须以JSON对象{{"data": [...]}}的格式返回，不能拆分到json外。禁止输出任何额外的解释性文字！"""
-    system_prompt = custom_prompt.strip() or default_system_prompt
+    system_prompt = str(custom_prompt or "").strip()
+    if not system_prompt:
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return None
 
     try:
         logger.info(f"正在让 AI [模型:{model}] 思考与生成 {len(keywords)} 个关键词的内容规划 (耗时较长，请耐心等待)...")
@@ -1233,7 +1445,10 @@ def _parse_ai_json(raw_str: str) -> list[dict]:
         except json.JSONDecodeError:
             logger.warning(f"模型返回 JSON 解码失败（尝试解析片段 {idx}/{len(candidates)}）。")
         except Exception as e:
-            logger.warning(f"模型返回 JSON 解析异常（片段 {idx}/{len(candidates)}）: {e}")
+            logger.warning(
+                f"模型返回 JSON 解析异常（片段 {idx}/{len(candidates)}）: "
+                f"{_redact_ai_error(e)}"
+            )
 
     # 兼容 AI 返回单引号 dict/list（例如 Python 字面量）
     for idx, candidate in enumerate(candidates, start=1):
@@ -1283,6 +1498,11 @@ async def generate_with_score_retry(
         解析后的 list[dict]，每个 dict 额外携带 '_seo_score' 键。
         若全部尝试均失败，返回空列表。
     """
+    effective_prompt = str(custom_prompt or SEO_SYSTEM_PROMPT or "").strip()
+    if not effective_prompt:
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return []
+
     best_result: list[dict] = []       # 保存历史最高分的那一批结果
     best_min_score: int = -1           # 历史最高的「批次最低分」
     extra_hint: str = ""               # 失分原因，拼入下一轮 prompt
@@ -1324,7 +1544,7 @@ async def generate_with_score_retry(
                 hint_keywords,
                 main_img_url,
                 model=active_model,
-                custom_prompt=custom_prompt,
+                custom_prompt=effective_prompt,
             )
         except Exception as exc:
             if not _is_non_retryable_ai_error(exc):
@@ -1356,7 +1576,7 @@ async def generate_with_score_retry(
                         hint_keywords,
                         main_img_url,
                         model=BAK_DEFAULT_MODEL or DEFAULT_MODEL,
-                        custom_prompt=custom_prompt,
+                        custom_prompt=effective_prompt,
                     )
                 except Exception as backup_exc:
                     backup_status = _ai_error_status_code(backup_exc)
@@ -1470,13 +1690,19 @@ def _get_post_type_capability(post_type: str = "product") -> dict:
         if not isinstance(data, dict):
             data = {}
 
-        for endpoint in data.get("endpoints", []):
+        endpoints = data.get("endpoints", []) or []
+        if not endpoints and "POST" in {str(method).upper() for method in data.get("methods", [])}:
+            endpoints = [data]
+        for endpoint in endpoints:
             methods = [str(m).upper() for m in endpoint.get("methods", [])]
             if "POST" not in methods:
                 continue
 
             args = endpoint.get("args", {}) or {}
-            meta_props = ((args.get("meta") or {}).get("properties") or {})
+            meta = args.get("meta") or {}
+            meta_props = (meta.get("properties") or {}) if isinstance(meta, dict) else {}
+            if not meta_props and isinstance(meta, dict):
+                meta_props = {key: value for key, value in meta.items() if key in YOAST_REQUIRED_META_KEYS}
             capability["writable_meta_keys"] = set(meta_props.keys())
             capability["supports_featured_media"] = "featured_media" in args
             break
@@ -1488,7 +1714,7 @@ def _get_post_type_capability(post_type: str = "product") -> dict:
             len(capability["writable_meta_keys"]),
         )
     except Exception as e:
-        logger.warning(f"⚠️ 获取 REST 能力失败，回退默认逻辑: {e}")
+        logger.warning(f"⚠️ 获取 REST 能力失败，回退默认逻辑: {_redact_ai_error(e)}")
 
     POST_TYPE_CAPABILITY_CACHE[post_type] = capability
     return capability
@@ -1670,7 +1896,15 @@ def _sync_wc_product_media_schema(product_id: int, thumbnail_id: str, gallery_id
             data_raw = resp.json()
             data = data_raw if isinstance(data_raw, dict) else {}
 
-            image_count = len(data.get("images", []) or [])
+            returned_images = data.get("images", []) or []
+            returned_image_ids = {
+                str(item.get("id"))
+                for item in returned_images
+                if isinstance(item, dict) and item.get("id") is not None
+            }
+            expected_image_ids = {str(image_id) for image_id in image_ids}
+            images_ok = expected_image_ids.issubset(returned_image_ids)
+            image_count = len(returned_images)
             has_schema = True
             if schema_str:
                 has_schema = any(
@@ -1680,6 +1914,12 @@ def _sync_wc_product_media_schema(product_id: int, thumbnail_id: str, gallery_id
 
             if schema_str and not has_schema:
                 logger.warning("⚠️ WooCommerce 返回中未检测到 schema meta，可能被服务端过滤。")
+            if expected_image_ids and not images_ok:
+                logger.warning(
+                    "⚠️ WooCommerce 返回的图片 ID 不完整，期望=%s，实际=%s。",
+                    sorted(expected_image_ids),
+                    sorted(returned_image_ids),
+                )
 
             logger.info(
                 "✅ 产品 [%s] WC 同步成功：images=%s, schema=%s",
@@ -1687,12 +1927,14 @@ def _sync_wc_product_media_schema(product_id: int, thumbnail_id: str, gallery_id
                 image_count,
                 "ok" if has_schema else "missing"
             )
-            return has_schema or not schema_str
+            return images_ok and (has_schema or not schema_str)
         except requests.exceptions.HTTPError as http_err:
-            err_text = http_err.response.text if hasattr(http_err, 'response') and hasattr(http_err.response, 'text') else ''
-            logger.warning(f"❌ WC 同步失败 (尝试 {attempt+1}/5): {http_err} {err_text}")
+            logger.warning(
+                f"❌ WC 同步失败 (尝试 {attempt+1}/5): "
+                f"{_http_error_diagnostic(http_err)}"
+            )
         except Exception as e:
-            logger.warning(f"❌ WC 同步异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(f"❌ WC 同步异常 (尝试 {attempt+1}/5): {_redact_ai_error(e)}")
 
         if attempt < 4:
             time.sleep(2)
@@ -1725,13 +1967,14 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
         if schema_str and not can_write_schema_meta:
             logger.warning("⚠️ 当前 wp/v2 端点未暴露 saswp_custom_schema_field，稍后将走 WC API 回写。")
 
-        # 步骤 2.1: 创建核心字段（固定链接/正文内容） -> HTTP POST
+        # 步骤 2.1: 先创建草稿。只有媒体、Schema 和 Yoast 都成功后才正式发布，
+        # 避免 SEO 写入失败时留下线上残缺产品。
         wp_create_url = f"{WP_URL}/product"
         wp_payload = {
             "title": wp_title,
             "slug": slug,
             "content": content,
-            "status": "publish",  # 直接发布
+            "status": "draft",
         }
 
         if supports_featured_media and str(thumbnail_id).strip().isdigit():
@@ -1757,7 +2000,7 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
         new_product_id = None
         for attempt in range(5):
             try:
-                logger.info(f"  -> 正在向 WordPress 提交并发布新产品 [{wp_title}...] (尝试 {attempt+1}/5)...")
+                logger.info(f"  -> 正在向 WordPress 创建产品草稿 [{wp_title}...] (尝试 {attempt+1}/5)...")
                 res_wp = requests.post(
                     wp_create_url,
                     json=wp_payload,
@@ -1774,12 +2017,17 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
                 else:
                     logger.error("❌ 产品已响应但未能获取到有效的新建 ID!")
             except requests.exceptions.HTTPError as http_err:
-                err_text = http_err.response.text if hasattr(http_err, 'response') and hasattr(http_err.response, 'text') else ''
-                logger.warning(f"❌ HTTP 通信层写入 WordPress 失败 (尝试 {attempt+1}/5): {http_err} {err_text}")
+                logger.warning(
+                    f"❌ HTTP 通信层写入 WordPress 失败 (尝试 {attempt+1}/5): "
+                    f"{_http_error_diagnostic(http_err)}"
+                )
                 if attempt < 4:
                     time.sleep(2)
             except Exception as e:
-                logger.warning(f"❌ 创建产品遇到未知网络异常 (尝试 {attempt+1}/5): {e}")
+                logger.warning(
+                    f"❌ 创建产品遇到未知网络异常 (尝试 {attempt+1}/5): "
+                    f"{_redact_ai_error(e)}"
+                )
                 if attempt < 4:
                     time.sleep(2)
 
@@ -1813,9 +2061,19 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
                         logger.info(f"✅ 产品 [{new_product_id}] JSON-LD 兜底注入成功。")
                         break
                     except Exception as e:
-                        logger.warning(f"❌ JSON-LD 兜底注入失败 (尝试 {attempt+1}/5): {e}")
+                        logger.warning(
+                            f"❌ JSON-LD 兜底注入失败 (尝试 {attempt+1}/5): "
+                            f"{_redact_ai_error(e)}"
+                        )
                         if attempt < 4:
                             time.sleep(2)
+
+        if not wc_sync_ok:
+            logger.error(
+                "❌ 产品 [%s] 媒体/Schema 回写未确认成功，产品保留为草稿，不继续发布。",
+                new_product_id,
+            )
+            return None
 
         # 步骤 2.3: 使用刚获取的新 ID 更新 Yoast SEO 元数据
         yoast_ok = sync_yoast_seo(
@@ -1826,13 +2084,47 @@ def publish_product_to_wordpress(ai_data: dict, cat_id: int = None, thumbnail_id
             description,
         )
         if yoast_ok:
+            # SEO 写入成功后才切换为 publish；发布失败时产品仍保持草稿，方便下次重试。
+            published = None
+            for attempt in range(5):
+                try:
+                    publish_res = requests.post(
+                        f"{WP_URL}/product/{new_product_id}",
+                        json={"status": "publish"},
+                        auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+                        timeout=20,
+                    )
+                    publish_res.raise_for_status()
+                    candidate = _json_object_or_raise(publish_res, "发布产品")
+                    if candidate.get("status") != "publish":
+                        raise UnexpectedWPResponseError(
+                            f"发布响应状态异常: {_response_diagnostic(publish_res)}"
+                        )
+                    published = candidate
+                    break
+                except Exception as publish_err:
+                    logger.warning(
+                        "❌ 产品 [%s] 发布失败 (尝试 %s/5): %s",
+                        new_product_id,
+                        attempt + 1,
+                        _redact_ai_error(publish_err),
+                    )
+                    if attempt < 4:
+                        time.sleep(2)
+            if not published:
+                logger.error(
+                    "❌ 产品 [%s] Yoast 已同步但正式发布失败，产品保留为草稿。",
+                    new_product_id,
+                )
+                return None
             logger.info(f"✅ 产品 [{new_product_id}] 所有项已成功发布并同步了 Yoast SEO 数据！")
         else:
             logger.error(f"❌ 产品 [{new_product_id}] 基础信息创建成功，但 Yoast SEO 元数据写入失败。")
+            return None
         return new_product_id
 
     except Exception as e:
-        logger.error(f"❌ 解析或者结构拼接前出现严重异常: {e}")
+        logger.error(f"❌ 解析或者结构拼接前出现严重异常: {_redact_ai_error(e)}")
 
     return None
 
@@ -1843,14 +2135,28 @@ async def main():
 
     if not AI_API_KEY:
         logger.error("在开始之前，请务必保证你挂载了对应的 API 环境变量！")
-        return
+        return 1
+
+    if not SEO_SYSTEM_PROMPT.strip():
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return 1
+    if not SEO_CATEGORY_SYSTEM_PROMPT.strip():
+        logger.error("SEO 分类提示词为空，请在 GUI 页面填写后再运行。")
+        return 1
 
     base_dir = (os.getenv("WP4AI_PRODUCTS_DIR") or "products").strip() or "products"
     base_dir = os.path.abspath(base_dir)
     logger.info(f"📁 产品目录: {base_dir}")
     if not os.path.exists(base_dir) or not os.path.isdir(base_dir):
         logger.error(f"当前目录下未找到 [{base_dir}] 文件夹，任务已退出。")
-        return
+        return 1
+
+    # 每次进程启动都重新探测，避免站点/插件变更沿用旧能力缓存。
+    POST_TYPE_CAPABILITY_CACHE.clear()
+    global YOAST_INTEGRATION_MODE
+    YOAST_INTEGRATION_MODE = None
+    if not preflight_wordpress():
+        return 1
 
     client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
     logger.info(
@@ -1892,7 +2198,9 @@ async def main():
                 logger.info(f"🌐 站点名称: {SITENAME!r}")
             break
         except Exception as e:
-            logger.warning(f"⚠️ 获取站点名称失败 (尝试 {attempt}/5): {e}")
+            logger.warning(
+                f"⚠️ 获取站点名称失败 (尝试 {attempt}/5): {_redact_ai_error(e)}"
+            )
             if _is_sgcaptcha_error(e):
                 SITENAME = _default_sitename
                 wp_api_blocked = True
@@ -1914,7 +2222,11 @@ async def main():
         logger.info("🔍 --scan 模式：递归扫描目录树建立分类...")
         cat_cache: dict = {}
         actual_names: dict = {}
-        await scan_and_build_cat_cache(client, base_dir, cat_cache, actual_names)
+        try:
+            await scan_and_build_cat_cache(client, base_dir, cat_cache, actual_names)
+        except Exception as exc:
+            logger.error("分类预处理失败，已停止运行：%s", _redact_ai_error(exc))
+            return 1
         logger.info("🎉 --scan 完成！")
         return
 
@@ -1931,7 +2243,11 @@ async def main():
     cat_cache: dict = {}       # (parent_id, name.lower()) -> cat_id
     actual_names: dict = {}    # path_tuple -> 当前真实目录名（含 [ID] 前缀）
     logger.info("\n===== 阶段一：建立分类体系 =====")
-    await scan_and_build_cat_cache(client, base_dir, cat_cache, actual_names)
+    try:
+        await scan_and_build_cat_cache(client, base_dir, cat_cache, actual_names)
+    except Exception as exc:
+        logger.error("分类预处理失败，已停止产品发布：%s", _redact_ai_error(exc))
+        return 1
 
     # 阶段二：遍历所有叶子产品目录（无子目录的目录）发布产品
     logger.info("\n===== 阶段二：发布产品 =====")
@@ -1960,7 +2276,7 @@ async def main():
                         os.rename(img_path, os.path.join(os.path.dirname(img_path), new_name))
                         logger.info(f"    🌟 图片已标记: {new_name}")
                     except Exception as e:
-                        logger.error(f"图片重命名失败: {e}")
+                        logger.error(f"图片重命名失败: {_redact_ai_error(e)}")
                 else:
                     failed_image_paths.append(img_path)
                     logger.error(
@@ -1996,9 +2312,9 @@ async def main():
                     uploaded_images[0] = (thumbnail_id, main_image_url)
                     logger.info(f"    🔄 已补齐主图 URL: {main_image_url}")
                 except UnexpectedWPResponseError as e:
-                    logger.warning(f"无法获取主图 URL: {e}")
+                    logger.warning(f"无法获取主图 URL: {_redact_ai_error(e)}")
                 except Exception as e:
-                    logger.warning(f"无法获取主图 URL: {e}")
+                    logger.warning(f"无法获取主图 URL: {_redact_ai_error(e)}")
             if len(uploaded_images) > 1:
                 gallery_ids = ",".join(str(img[0]) for img in uploaded_images[1:])
 
@@ -2060,9 +2376,9 @@ async def main():
                     os.rename(prod_path, new_prod_path)
                     logger.info(f"    ✅ 产品目录已标记完成: {marked_name}")
                 except Exception as e:
-                    logger.error(f"重命名产品完成标记失败: {e}")
+                    logger.error(f"重命名产品完成标记失败: {_redact_ai_error(e)}")
         except Exception as e:
-            logger.error(f"产品发布流水线异常: {e}")
+            logger.error(f"产品发布流水线异常: {_redact_ai_error(e)}")
 
     walk_base_dir = _to_long_path(base_dir)
     if walk_base_dir != base_dir:
@@ -2110,4 +2426,4 @@ async def main():
     logger.info("\n🎉 本次全自动化目录扫描及发帖任务已成功跑完！")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()) or 0)

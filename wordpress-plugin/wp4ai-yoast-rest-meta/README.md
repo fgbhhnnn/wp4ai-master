@@ -22,5 +22,5 @@ anonymous visitors.
 - `_yoast_wpseo_metadesc`
 
 The existing `saswp_custom_schema_field` integration remains separate. Yoast
-generates its own Schema graph, so this plugin does not register a replacement
-for any legacy SEO plugin's Schema REST endpoint.
+generates its own Schema graph, so this plugin only registers the three metadata
+fields listed above and does not alter Schema output.

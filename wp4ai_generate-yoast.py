@@ -36,9 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 读取配置文件
-config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+# 读取配置文件。GUI 通过 WP4AI_CONFIG 传入临时配置，保持与主 worker 一致。
+config = configparser.ConfigParser(interpolation=None)
+config_path = (os.getenv("WP4AI_CONFIG") or "").strip()
+if not config_path:
+    config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 
 if not os.path.exists(config_path):
     config_path = 'config.ini'
@@ -61,7 +63,7 @@ try:
     BAK_DEFAULT_MODEL = config.get('AI', 'BAK_DEFAULT_MODEL', fallback=None) or None
 
     # WordPress 接口相关的常量配置
-    WP_DOMAIN = config.get('WordPress', 'WP_DOMAIN')
+    WP_DOMAIN = str(config.get('WordPress', 'WP_DOMAIN')).strip().rstrip('/')
     WP_PRODUCT_URL = WP_DOMAIN+"/products/"
     WP_ABOUT_URL = WP_DOMAIN+"/junhao-clothing-streetwear/"
     WP_CONTACT_URL = WP_DOMAIN+"/contact/"
@@ -82,9 +84,18 @@ except (configparser.NoSectionError, configparser.NoOptionError) as e:
 # SEO_MAX_RETRIES: 单次产品最多重新生成次数（含第 1 次）
 SEO_MIN_SCORE: int = int(config.get('SEO', 'SEO_MIN_SCORE', fallback='65'))
 SEO_MAX_RETRIES: int = int(config.get('SEO', 'SEO_MAX_RETRIES', fallback='5'))
+SEO_SYSTEM_PROMPT: str = config.get('SEO', 'SEO_SYSTEM_PROMPT', fallback='')
+SEO_CATEGORY_SYSTEM_PROMPT: str = config.get('SEO', 'SEO_CATEGORY_SYSTEM_PROMPT', fallback='')
 
 # 站点名称（main() 启动时从 WP 拉取，供分类 AI Prompt 使用）
 SITENAME: str = ""
+YOAST_INTEGRATION_MODE: str | None = None
+YOAST_HEAD_AVAILABLE: bool = False
+YOAST_REQUIRED_META_KEYS = frozenset({
+    "_yoast_wpseo_focuskw",
+    "_yoast_wpseo_title",
+    "_yoast_wpseo_metadesc",
+})
 
 # === 核心处理函数 ===
 
@@ -114,7 +125,10 @@ def ensure_wp_category(category_name: str) -> int:
             new_cat = res_post.json()
             return new_cat.get('id')
         except Exception as e:
-            logger.warning(f"获取/创建分类【{category_name}】时网络异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"获取/创建分类【{category_name}】时网络异常 (尝试 {attempt+1}/5): "
+                f"{_redact_error_text(e)}"
+            )
             if attempt < 4:
                 time.sleep(2)
             else:
@@ -136,14 +150,22 @@ def _extract_id_and_name(raw_name: str) -> tuple:
     return None, raw_name
 
 
-async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
-    """为分类名生成描述；分类 Yoast 元数据由人工在后台维护。"""
+async def _generate_cat_seo(
+    client: AsyncOpenAI,
+    cat_name: str,
+    custom_prompt: str = "",
+) -> dict:
+    """使用 GUI 提供的提示词生成分类 SEO 描述。"""
     prompt = f"- 公司名称:{SITENAME}\n- 网站网址:{WP_DOMAIN}\n- 产品类目:{cat_name}"
+    system_prompt = str(custom_prompt or SEO_CATEGORY_SYSTEM_PROMPT or "").strip()
+    if not system_prompt:
+        logger.error("SEO 分类提示词为空，请在 GUI 页面填写后再运行。")
+        return {}
     try:
         resp = await client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": """你是专业 B2B 跨境 SEO 文案专家。请只返回 JSON 对象 {\"description\":\"\"}，不要输出解释文字。分类描述必须为纯英文、简洁、面向采购商，突出材质、定制能力和中国工厂优势；禁止虚构价格、MOQ、交期、认证或产能。"""},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             stream=False,
@@ -154,7 +176,7 @@ async def _generate_cat_seo(client: AsyncOpenAI, cat_name: str) -> dict:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception as e:
-        logger.warning(f"分类 [{cat_name}] SEO 生成失败: {e}")
+        logger.warning(f"分类 [{cat_name}] SEO 生成失败: {_redact_error_text(e)}")
         return {}
 
 
@@ -189,7 +211,10 @@ async def _ensure_cat_with_parent(
                     return cat["id"]
             break
         except Exception as e:
-            logger.warning(f"  查询分类【{name}】异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"  查询分类【{name}】异常 (尝试 {attempt+1}/5): "
+                f"{_redact_error_text(e)}"
+            )
             if attempt < 4:
                 await asyncio.sleep(2)
             else:
@@ -197,7 +222,11 @@ async def _ensure_cat_with_parent(
 
     # 不存在 → AI 生成描述并新建
     logger.info(f"  -> 新建分类【{name}】(parent:{parent_id})...")
-    ai = await _generate_cat_seo(client, name)
+    ai = await _generate_cat_seo(
+        client,
+        name,
+        custom_prompt=SEO_CATEGORY_SYSTEM_PROMPT,
+    )
     description = ai.get("description", ai.get("seoDescription", ""))
 
     cat_id = None
@@ -216,7 +245,10 @@ async def _ensure_cat_with_parent(
             logger.info(f"  ✅ 分类【{name}】新建成功 ID:{cat_id}")
             break
         except Exception as e:
-            logger.warning(f"  新建分类【{name}】异常 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"  新建分类【{name}】异常 (尝试 {attempt+1}/5): "
+                f"{_redact_error_text(e)}"
+            )
             if attempt < 4:
                 await asyncio.sleep(2)
             else:
@@ -298,7 +330,7 @@ async def scan_and_build_cat_cache(
                 elif os.path.exists(new_abs):
                     actual_names[path_tuple] = new_raw
             except Exception as e:
-                logger.warning(f"  ⚠️ 重命名失败（不影响分类建立）: {e}")
+                logger.warning(f"  ⚠️ 重命名失败（不影响分类建立）: {_redact_error_text(e)}")
 
 
 async def update_categories_description(client: AsyncOpenAI) -> None:
@@ -321,7 +353,7 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                 break
             page += 1
         except Exception as e:
-            logger.error(f"❌ 获取分类列表失败 (第 {page} 页): {e}")
+            logger.error(f"❌ 获取分类列表失败 (第 {page} 页): {_redact_error_text(e)}")
             break
 
     need = [c for c in all_cats if not (c.get("description") or "").strip()]
@@ -330,7 +362,11 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
     for cat in need:
         cat_id, cat_name = cat.get("id"), cat.get("name", "")
         logger.info(f"\n>>> 补全分类【{cat_name}】(ID:{cat_id})...")
-        ai = await _generate_cat_seo(client, cat_name)
+        ai = await _generate_cat_seo(
+            client,
+            cat_name,
+            custom_prompt=SEO_CATEGORY_SYSTEM_PROMPT,
+        )
         if not ai:
             continue
         description = ai.get("description", ai.get("seoDescription", ""))
@@ -346,7 +382,9 @@ async def update_categories_description(client: AsyncOpenAI) -> None:
                 logger.info(f"  ✅ 描述已更新（{len(description)} 字符）")
                 break
             except Exception as e:
-                logger.warning(f"  PATCH 失败 (尝试 {attempt+1}/5): {e}")
+                logger.warning(
+                    f"  PATCH 失败 (尝试 {attempt+1}/5): {_redact_error_text(e)}"
+                )
                 if attempt < 4:
                     await asyncio.sleep(2)
     logger.info(f"\n🎉 --update 完成！")
@@ -380,7 +418,10 @@ def upload_wp_media(file_path: str):
             data = res.json()
             return data.get("id"), data.get("source_url")
         except Exception as e:
-            logger.warning(f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): {e}")
+            logger.warning(
+                f"❌ 上传图片 {filename} 失败 (尝试 {attempt+1}/5): "
+                f"{_redact_error_text(e)}"
+            )
             if attempt < 4:
                 time.sleep(2)
             else:
@@ -393,6 +434,7 @@ async def generate_seo_data_by_keywords(
     keywords: list[str],
     main_img_url: str = "",
     model: str = DEFAULT_MODEL,
+    custom_prompt: str = "",
 ):
     """根据产品关键词生成可供 Yoast 和 SASWP 使用的英文 SEO 数据。"""
     product_input = "、".join(keywords)
@@ -404,10 +446,14 @@ async def generate_seo_data_by_keywords(
             f'<img src="{main_img_url}" alt="focus keyphrase" />. '
         )
 
-    # 压缩长版行业提示词，只保留影响字段正确性和发布安全的强约束。
-    prompt = (
-       
-    )
+    system_prompt = str(custom_prompt or SEO_SYSTEM_PROMPT or "").strip()
+    if not system_prompt:
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return None
+
+    prompt = product_input
+    if image_instruction:
+        prompt = f"{prompt}\n{image_instruction}"
 
     try:
         response = await client.chat.completions.create(
@@ -415,7 +461,7 @@ async def generate_seo_data_by_keywords(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a Yoast SEO Premium cannabis packaging B2B expert.",
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -440,7 +486,7 @@ async def generate_seo_data_by_keywords(
             return None
         return content
     except Exception as exc:
-        logger.error("调用 AI 接口时发生异常: %s", exc, exc_info=True)
+        logger.error("调用 AI 接口时发生异常: %s", _redact_error_text(exc))
         return None
 
 
@@ -607,11 +653,17 @@ async def generate_with_score_retry(
     keywords: list[str],
     main_img_url: str = "",
     *,
+    custom_prompt: str = "",
     min_score: int = SEO_MIN_SCORE,
     max_retries: int = SEO_MAX_RETRIES,
     bak_client: AsyncOpenAI = None,
 ) -> list[dict]:
     """生成并校验产品 SEO 数据，返回所有通过归一化的产品。"""
+    effective_prompt = str(custom_prompt or SEO_SYSTEM_PROMPT or "").strip()
+    if not effective_prompt:
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return []
+
     best_result = []
     best_score = -1
     hint = ""
@@ -620,7 +672,11 @@ async def generate_with_score_retry(
         model = BAK_DEFAULT_MODEL if active_client is bak_client and bak_client else DEFAULT_MODEL
         request_keywords = keywords + ([hint] if hint else [])
         raw = await generate_seo_data_by_keywords(
-            active_client, request_keywords, main_img_url, model=model
+            active_client,
+            request_keywords,
+            main_img_url,
+            model=model,
+            custom_prompt=effective_prompt,
         )
         if not raw:
             continue
@@ -631,7 +687,7 @@ async def generate_with_score_retry(
         try:
             normalized = [normalize_ai_item(item) for item in items]
         except (TypeError, ValueError) as exc:
-            logger.warning("第 %s 次 AI 结果字段无效: %s", attempt, exc)
+            logger.warning("第 %s 次 AI 结果字段无效: %s", attempt, _redact_error_text(exc))
             continue
         if not normalized:
             continue
@@ -680,57 +736,160 @@ async def generate_with_score_retry(
     return []
 
 
+def _redact_error_text(value, limit: int = 500) -> str:
+    """Remove API keys, bearer tokens, and JSON/form secrets from diagnostics."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"(?i)\b(?:bearer\s+)?[A-Za-z0-9._-]*sk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)\bsk-[A-Za-z0-9._-]+\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(
+        r"(?i)([\"']?authorization[\"']?\s*[:=]\s*)([\"']?)bearer\s+[^\"'\s,;}]+(\2)",
+        r"\1\2[REDACTED]\3",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([\"']?(?:authorization|api[ _-]?key|password|secret|token)[\"']?\s*[:=]\s*)([\"']?)(?!\[REDACTED_API_KEY\])([^\"'\s,;}]+)(\2)",
+        r"\1\2[REDACTED]\4",
+        text,
+    )
+    return text[:limit]
+
+
 def _request_json(method: str, url: str, **kwargs) -> dict:
     """执行带认证的 JSON 请求并返回对象；错误包含响应正文便于诊断。"""
     response = requests.request(
         method, url, auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD), timeout=30, **kwargs
     )
     if not response.ok:
-        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
-    return response.json() if response.content else {}
+        body = _redact_error_text(response.text or "")
+        raise RuntimeError(f"HTTP {response.status_code}: {body[:500]}")
+    try:
+        return response.json() if response.content else {}
+    except ValueError as exc:
+        raise RuntimeError(f"HTTP {response.status_code}: 响应不是合法 JSON") from exc
+
+
+def _route_is_available(routes: dict, route: str) -> bool:
+    target = str(route).rstrip("/")
+    return any(
+        (candidate := str(item).rstrip("/")) == target or candidate.startswith(target + "/")
+        for item in (routes or {})
+    )
+
+
+def _options_writable_meta(post_type: str) -> set[str]:
+    try:
+        schema = _request_json("OPTIONS", f"{WP_URL}/{post_type}")
+    except Exception as exc:
+        logger.warning("获取 %s REST 能力失败: %s", post_type, _redact_error_text(exc))
+        return set()
+    writable: set[str] = set()
+    if not isinstance(schema, dict):
+        return writable
+    endpoints = schema.get("endpoints", []) or []
+    if not endpoints and "POST" in {str(method).upper() for method in schema.get("methods", [])}:
+        endpoints = [schema]
+    for endpoint in endpoints:
+        if "POST" not in {str(method).upper() for method in endpoint.get("methods", [])}:
+            continue
+        args = endpoint.get("args", {}) or {}
+        meta = args.get("meta") or {}
+        writable.update((meta.get("properties") or {}).keys())
+        if not meta.get("properties"):
+            writable.update(key for key in meta if key in YOAST_REQUIRED_META_KEYS)
+    return writable
 
 
 def preflight_wordpress() -> bool:
-    """验证目标站点路由、产品类型和 Yoast 管理权限。"""
+    """验证目标站点路由并选择 Yoast Premium 或辅助插件写入路径。"""
+    global YOAST_INTEGRATION_MODE, YOAST_HEAD_AVAILABLE
+    YOAST_HEAD_AVAILABLE = False
     try:
         root = _request_json("GET", f"{WP_DOMAIN}/wp-json/")
         routes = root.get("routes", {})
-        required = ["/wp/v2/product", "/yoast/v1/bulk_editor/update_search"]
-        if any(route not in routes for route in required):
-            logger.error("目标站点缺少必要 REST 路由: %s", required)
+        if not _route_is_available(routes, "/wp/v2/product"):
+            logger.error("目标站点缺少必要 REST 路由: /wp/v2/product")
             return False
-        schema = _request_json("OPTIONS", f"{WP_URL}/product")
-        methods = schema.get("methods", [])
-        if "POST" not in methods:
-            logger.error("当前账号无法创建 WooCommerce product")
+        if not _route_is_available(routes, "/wp/v2/product_cat"):
+            logger.error("目标站点缺少必要 REST 路由: /wp/v2/product_cat")
             return False
+
+        bulk_available = _route_is_available(routes, "/yoast/v1/bulk_editor/update_search")
+        if bulk_available:
+            YOAST_INTEGRATION_MODE = "bulk"
+            YOAST_HEAD_AVAILABLE = _route_is_available(routes, "/yoast/v1/get_head")
+            if not YOAST_HEAD_AVAILABLE:
+                logger.warning("Yoast get_head 路由不可用，将跳过发布后的 SEO head 回查。")
+        elif (
+            YOAST_REQUIRED_META_KEYS.issubset(_options_writable_meta("product"))
+            and YOAST_REQUIRED_META_KEYS.issubset(_options_writable_meta("product_cat"))
+        ):
+            YOAST_INTEGRATION_MODE = "meta"
+        else:
+            YOAST_INTEGRATION_MODE = "none"
+            logger.error(
+                "❌ 当前站点未检测到可用的 Yoast SEO 写入方式。"
+                "请安装并启用 wp4ai-yoast-rest-meta 辅助插件，"
+                "或安装/启用提供 yoast/v1 REST 路由的 Yoast SEO Premium。"
+                "本次未创建产品。"
+            )
+            return False
+
         current_user = _request_json("GET", f"{WP_URL}/users/me", params={"context": "edit"})
         if not current_user.get("id"):
             logger.error("WordPress 账号身份校验失败")
             return False
-        # 空批次不会写入数据；有权限时 Yoast 返回 400 参数校验错误，无权限返回 401/403。
-        permission_probe = requests.post(
-            WP_YOAST_BULK_URL,
-            json={"items": []},
-            auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
-            timeout=20,
-        )
-        if permission_probe.status_code not in (400,):
-            logger.error(
-                "账号缺少 Yoast 管理权限，权限探测返回 HTTP %s: %s",
-                permission_probe.status_code,
-                permission_probe.text[:300],
+        if YOAST_INTEGRATION_MODE == "bulk":
+            # 空批次不会写入数据；有权限时 Yoast 返回 400 参数校验错误。
+            permission_probe = requests.post(
+                WP_YOAST_BULK_URL,
+                json={"items": []},
+                auth=HTTPBasicAuth(WP_USERNAME, WP_PASSWORD),
+                timeout=20,
             )
-            return False
-        logger.info("WordPress/Yoast 路由预检通过。")
+            probe_ok = permission_probe.status_code == 200
+            if permission_probe.status_code == 400:
+                try:
+                    probe_payload = permission_probe.json()
+                except Exception:
+                    probe_payload = {}
+                probe_code = str(probe_payload.get("code", "")).lower()
+                probe_message = str(probe_payload.get("message", "")).lower()
+                # 空批次应只触发参数校验；权限、认证或服务器错误不能视为可写。
+                probe_ok = (
+                    "invalid" in probe_code
+                    or "param" in probe_code
+                    or "item" in probe_message
+                    or "required" in probe_message
+                )
+            if not probe_ok:
+                logger.error(
+                    "账号缺少 Yoast 管理权限，权限探测返回 HTTP %s: %s",
+                    permission_probe.status_code,
+                    _redact_error_text(permission_probe.text)[:300],
+                )
+                return False
+        logger.info("WordPress/Yoast 路由预检通过（写入模式: %s）。", YOAST_INTEGRATION_MODE)
         return True
     except Exception as exc:
-        logger.error("WordPress 预检失败: %s", exc)
+        logger.error("WordPress 预检失败: %s", _redact_error_text(exc))
         return False
 
 
 def _yoast_update(product_id: int, data: dict) -> None:
-    """通过 Yoast Premium Bulk Editor 写入三项搜索外观字段。"""
+    """Write Yoast fields through the path selected by ``preflight_wordpress``."""
+    if YOAST_INTEGRATION_MODE == "meta":
+        _request_json(
+            "POST",
+            f"{WP_URL}/product/{int(product_id)}",
+            json={"meta": {
+                "_yoast_wpseo_focuskw": data["focusKeyphrase"],
+                "_yoast_wpseo_title": data["seoTitle"],
+                "_yoast_wpseo_metadesc": data["metaDescription"],
+            }},
+        )
+        return
+    if YOAST_INTEGRATION_MODE != "bulk":
+        raise RuntimeError("Yoast 集成尚未通过预检")
     payload = {"items": [{
         "id": int(product_id),
         "seo_title": data["seoTitle"],
@@ -738,9 +897,31 @@ def _yoast_update(product_id: int, data: dict) -> None:
         "focus_keyphrase": data["focusKeyphrase"],
     }]}
     result = _request_json("POST", WP_YOAST_BULK_URL, json=payload)
-    entries = result.get("results", [])
-    if not entries or not entries[0].get("success"):
+    if not _yoast_bulk_result_success(result, product_id):
         raise RuntimeError(f"Yoast SEO 写入失败: {result}")
+
+
+def _yoast_bulk_result_success(payload: dict, object_id: int) -> bool:
+    """确认 Bulk Editor 返回的是当前对象的成功结果，而不是其它项目的结果。"""
+    if not isinstance(payload, dict):
+        return False
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload.get("success") is True
+    target = str(object_id)
+    matching = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        identifiers = (
+            item.get("id"),
+            item.get("post_id"),
+            item.get("term_id"),
+            item.get("object_id"),
+        )
+        if any(value is not None and str(value) == target for value in identifiers):
+            matching.append(item)
+    return bool(matching) and any(item.get("success") is True for item in matching)
 
 
 def _verify_yoast_head(product_url: str, data: dict) -> None:
@@ -822,6 +1003,19 @@ def publish_product_to_wordpress(
             wc_payload["images"] = images
         _request_json("PUT", f"{WC_URL}/products/{product_id}", json=wc_payload)
         verified = _request_json("GET", f"{WC_URL}/products/{product_id}")
+        if images:
+            expected_image_ids = {int(image["id"]) for image in images}
+            returned_image_ids = {
+                int(image.get("id"))
+                for image in (verified.get("images", []) or [])
+                if isinstance(image, dict) and str(image.get("id", "")).isdigit()
+            }
+            if not expected_image_ids.issubset(returned_image_ids):
+                raise RuntimeError(
+                    "产品图片回查不完整: "
+                    f"expected={sorted(expected_image_ids)}, "
+                    f"actual={sorted(returned_image_ids)}"
+                )
         actual = next((m.get("value") for m in verified.get("meta_data", [])
                        if m.get("key") == "_yoast_wpseo_keywordsynonyms"), None)
         expected = build_yoast_synonyms_value(data["keyphraseSynonyms"])
@@ -834,16 +1028,21 @@ def publish_product_to_wordpress(
         product_url = published.get("permalink") or created.get("link")
         if not product_url:
             raise RuntimeError("产品发布响应缺少 permalink")
-        _verify_yoast_head(product_url, data)
+        if YOAST_INTEGRATION_MODE == "bulk" and YOAST_HEAD_AVAILABLE:
+            _verify_yoast_head(product_url, data)
         logger.info("产品 [%s] 已发布并完成 Yoast SEO 校验。", product_id)
         return product_id
     except Exception as exc:
-        logger.error("产品 [%s] SEO/发布失败，保留草稿: %s", product_id, exc)
+        logger.error("产品 [%s] SEO/发布失败，保留草稿: %s", product_id, _redact_error_text(exc))
         try:
             _request_json("PUT", f"{WC_URL}/products/{product_id}",
                           json={"status": "draft"})
         except Exception as restore_exc:
-            logger.error("恢复产品 [%s] 草稿状态失败: %s", product_id, restore_exc)
+            logger.error(
+                "恢复产品 [%s] 草稿状态失败: %s",
+                product_id,
+                _redact_error_text(restore_exc),
+            )
         return None
 
 
@@ -854,12 +1053,24 @@ async def main():
 
     if not AI_API_KEY:
         logger.error("在开始之前，请务必保证你挂载了对应的 API 环境变量！")
-        return
+        return 1
 
-    base_dir = "products"
+    if not SEO_SYSTEM_PROMPT.strip():
+        logger.error("SEO 产品提示词为空，请在 GUI 页面填写后再运行。")
+        return 1
+    if not SEO_CATEGORY_SYSTEM_PROMPT.strip():
+        logger.error("SEO 分类提示词为空，请在 GUI 页面填写后再运行。")
+        return 1
+
+    base_dir = (os.getenv("WP4AI_PRODUCTS_DIR") or "products").strip() or "products"
+    base_dir = os.path.abspath(base_dir)
     if not os.path.exists(base_dir) or not os.path.isdir(base_dir):
         logger.error(f"当前目录下未找到 [{base_dir}] 文件夹，任务已退出。")
-        return
+        return 1
+
+    if not preflight_wordpress():
+        logger.error("WordPress/Yoast 预检未通过，未创建分类、上传图片或创建产品。")
+        return 1
 
     client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 
@@ -890,7 +1101,9 @@ async def main():
                 logger.info(f"🌐 站点名称: {SITENAME!r}")
             break
         except Exception as e:
-            logger.warning(f"⚠️ 获取站点名称失败 (尝试 {attempt}/5): {e}")
+            logger.warning(
+                f"⚠️ 获取站点名称失败 (尝试 {attempt}/5): {_redact_error_text(e)}"
+            )
             if attempt < 5:
                 await asyncio.sleep(2)
             else:
@@ -915,10 +1128,6 @@ async def main():
         return
 
     # === 模式 3（默认）：建分类 + 发布产品 ===
-    if not preflight_wordpress():
-        logger.error("WordPress/Yoast 预检未通过，未创建任何产品。")
-        return
-
     logger.info("📂 全流程模式：先建分类，再发布产品...")
 
     # 阶段一：递归扫描目录树，建好所有分类，cat_cache 中记录每层分类的 ID
@@ -968,7 +1177,7 @@ async def main():
                         os.rename(img_path, os.path.join(os.path.dirname(img_path), new_name))
                         logger.info(f"    🌟 图片已标记: {new_name}")
                     except Exception as e:
-                        logger.error(f"图片重命名失败: {e}")
+                        logger.error(f"图片重命名失败: {_redact_error_text(e)}")
         elif existing_images:
             logger.info(f"📸 发现 {len(existing_images)} 张已标记历史图片，直接复用。")
 
@@ -990,7 +1199,7 @@ async def main():
                     uploaded_images[0] = (thumbnail_id, main_image_url)
                     logger.info(f"    🔄 已补齐主图 URL: {main_image_url}")
                 except Exception as e:
-                    logger.warning(f"无法获取主图 URL: {e}")
+                    logger.warning(f"无法获取主图 URL: {_redact_error_text(e)}")
             if len(uploaded_images) > 1:
                 gallery_ids = ",".join(str(img[0]) for img in uploaded_images[1:])
 
@@ -998,6 +1207,7 @@ async def main():
         try:
             ai_data_list = await generate_with_score_retry(
                 client, [keyword], main_image_url,
+                custom_prompt=SEO_SYSTEM_PROMPT,
                 min_score=SEO_MIN_SCORE, max_retries=SEO_MAX_RETRIES,
                 bak_client=bak_client,
             )
@@ -1028,9 +1238,9 @@ async def main():
                     os.rename(prod_path, new_prod_path)
                     logger.info(f"    ✅ 产品目录已标记完成: {marked_name}")
                 except Exception as e:
-                    logger.error(f"重命名产品完成标记失败: {e}")
+                    logger.error(f"重命名产品完成标记失败: {_redact_error_text(e)}")
         except Exception as e:
-            logger.error(f"产品发布流水线异常: {e}")
+            logger.error(f"产品发布流水线异常: {_redact_error_text(e)}")
 
     # 递归找出所有叶子产品目录（无子目录的目录），并取其父目录对应的分类 ID
     for dirpath, dirnames, filenames in os.walk(base_dir):
@@ -1071,4 +1281,4 @@ async def main():
     logger.info("\n🎉 本次全自动化目录扫描及发帖任务已成功跑完！")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()) or 0)
